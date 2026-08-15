@@ -5,3 +5,4 @@ node_modules/
 *.tmp
 npm-debug.log*
 .DS_Store
+.env
