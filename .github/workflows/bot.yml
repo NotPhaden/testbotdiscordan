@@ -50,6 +50,8 @@ jobs:
             exit 0
           fi
 
-          git add state.json
-          git commit -m "chore: update MGKK rank state"
-          git push
+git add state.json
+git commit -m "chore: update MGKK rank state"
+
+git pull --rebase origin main
+git push origin main
