@@ -160,12 +160,12 @@ function createEmbed(oldRank, newRank, points) {
     .setTitle(title)
     .setDescription(description)
     .addFields(
-      { name: '⬅️ Loc anterior', value: formatRank(oldRank), inline: true },
-      { name: '🏆 Loc actual', value: formatRank(newRank), inline: true },
-      { name: '💎 Puncte', value: formatNumber(points), inline: true }
+{ name: '⬅️ Previous place', value: formatRank(oldRank), inline: true },
+{ name: '🏆 Current place', value: formatRank(newRank), inline: true },
+{ name: '💎 Points', value: formatNumber(points), inline: true }
     )
     .setTimestamp()
-    .setFooter({ text: 'MGKK League • BIG Games API' });
+    .setFooter({ text: 'MGKK League • MADE BY BRAT' });
 
   if (fs.existsSync(LOGO_FILE)) {
     embed.setThumbnail('attachment://logo.png');
