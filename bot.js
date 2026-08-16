@@ -149,12 +149,12 @@ function createEmbed(oldRank, newRank, points) {
   const difference = Math.abs(oldRank - newRank);
 
   const title = movedUp
-    ? `📈 ${LEAGUE_NAME} — AVANSARE!`
-    : `📉 ${LEAGUE_NAME} — DEZAVANSARE!`;
+    ? `📈 ${LEAGUE_NAME} — Increased !`
+    : `📉 ${LEAGUE_NAME} — Decreased !`;
 
   const description = movedUp
-    ? `**${LEAGUE_NAME}** a urcat **${difference} poziție${difference === 1 ? '' : 'i'}** în clasamentul ligii!`
-    : `**${LEAGUE_NAME}** a coborât **${difference} poziție${difference === 1 ? '' : 'i'}** în clasamentul ligii.`;
+    ? `**${LEAGUE_NAME}** Increased **${difference} poziție${difference === 1 ? '' : 'i'}** în clasamentul ligii!`
+    : `**${LEAGUE_NAME}** Decreased**${difference} poziție${difference === 1 ? '' : 'i'}** în clasamentul ligii.`;
 
   const embed = new EmbedBuilder()
     .setTitle(title)
