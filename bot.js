@@ -153,8 +153,8 @@ function createEmbed(oldRank, newRank, points) {
     : `📉 ${LEAGUE_NAME} — Decreased !`;
 
   const description = movedUp
-    ? `**${LEAGUE_NAME}** Increased **${difference} position${difference === 1 ? '' : 'i'}** în clasamentul ligii!`
-    : `**${LEAGUE_NAME}** Decreased **${difference} position${difference === 1 ? '' : 'i'}** în clasamentul ligii.`;
+    ? `**${LEAGUE_NAME}** Increased **${difference} position${difference === 1 ? '' : 'i'}** In League LeaderBoard!`
+    : `**${LEAGUE_NAME}** Decreased **${difference} position${difference === 1 ? '' : 'i'}** In League LeaderBoard!`;
 
   const embed = new EmbedBuilder()
     .setTitle(title)
