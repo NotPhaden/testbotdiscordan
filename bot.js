@@ -35,6 +35,7 @@ function defaultState() {
     rank: null,
     points: null,
     lastCheck: null,
+    ranking: null,
   };
 }
 
@@ -43,6 +44,7 @@ function loadState() {
     if (!fs.existsSync(STATE_FILE)) return defaultState();
 
     const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+
     return {
       ...defaultState(),
       ...state,
@@ -55,7 +57,13 @@ function loadState() {
 
 function saveState(state) {
   const tempFile = `${STATE_FILE}.tmp`;
-  fs.writeFileSync(tempFile, JSON.stringify(state, null, 2) + '\n', 'utf8');
+
+  fs.writeFileSync(
+    tempFile,
+    JSON.stringify(state, null, 2) + '\n',
+    'utf8'
+  );
+
   fs.renameSync(tempFile, STATE_FILE);
 }
 
@@ -86,19 +94,26 @@ async function api(pathname) {
   }
 
   if (json?.status === 'error') {
-    throw new Error(json?.error?.message || 'BIG Games API returned an error.');
+    throw new Error(
+      json?.error?.message ||
+      'BIG Games API returned an error.'
+    );
   }
 
   return json;
 }
 
 async function getLeague() {
-  const response = await api(`/leagues/${encodeURIComponent(LEAGUE_NAME)}`);
+  const response = await api(
+    `/leagues/${encodeURIComponent(LEAGUE_NAME)}`
+  );
+
   return response?.data ?? response;
 }
 
-async function getLeagueRank() {
+async function getLeagueRanking() {
   const pageSize = 100;
+  const ranking = [];
 
   for (let page = 1; page <= 1000; page++) {
     const response = await api(
@@ -117,23 +132,85 @@ async function getLeagueRank() {
       break;
     }
 
-    const exactIndex = leagues.findIndex(
-      league =>
-        String(league.Name || '').toLowerCase() ===
-        LEAGUE_NAME.toLowerCase()
-    );
+    for (const league of leagues) {
+      const name = String(league?.Name || '').trim();
 
-    if (exactIndex !== -1) {
-      // The BIG Games league listing is ordered by ranking/points.
-      // The league's zero-based position on its page gives its exact
-      // competition-table position.
-      return (page - 1) * pageSize + exactIndex + 1;
+      if (name) {
+        ranking.push(name);
+      }
     }
 
-    if (leagues.length < pageSize) break;
+    if (leagues.length < pageSize) {
+      break;
+    }
   }
 
-  throw new Error(`Could not find ${LEAGUE_NAME} in the league rankings.`);
+  const exactIndex = ranking.findIndex(
+    name =>
+      name.toLowerCase() === LEAGUE_NAME.toLowerCase()
+  );
+
+  if (exactIndex === -1) {
+    throw new Error(
+      `Could not find ${LEAGUE_NAME} in the league rankings.`
+    );
+  }
+
+  return {
+    rank: exactIndex + 1,
+    ranking,
+  };
+}
+
+function getPassedLeagues(
+  oldRank,
+  newRank,
+  oldRanking,
+  currentRanking
+) {
+  if (
+    !Array.isArray(oldRanking) ||
+    !Array.isArray(currentRanking)
+  ) {
+    return [];
+  }
+
+  if (newRank < oldRank) {
+    // MGKK moved UP.
+    // These are the leagues that were immediately ahead
+    // of MGKK in the previous snapshot.
+    return oldRanking.slice(
+      newRank - 1,
+      oldRank - 1
+    );
+  }
+
+  // MGKK moved DOWN.
+  // These are the leagues that are now immediately
+  // ahead of MGKK.
+  return currentRanking.slice(
+    oldRank,
+    newRank
+  );
+}
+
+function formatLeagueList(leagues) {
+  if (!leagues.length) {
+    return '• Could not determine the leagues for this change.';
+  }
+
+  const maxItems = 15;
+  const visible = leagues.slice(0, maxItems);
+
+  let text = visible
+    .map(name => `• **${name}**`)
+    .join('\n');
+
+  if (leagues.length > maxItems) {
+    text += `\n• **+${leagues.length - maxItems} more**`;
+  }
+
+  return text;
 }
 
 function formatNumber(value) {
@@ -144,7 +221,12 @@ function formatRank(rank) {
   return `#${formatNumber(rank)}`;
 }
 
-function createEmbed(oldRank, newRank, points) {
+function createEmbed(
+  oldRank,
+  newRank,
+  points,
+  movedLeagues
+) {
   const movedUp = newRank < oldRank;
   const difference = Math.abs(oldRank - newRank);
 
@@ -156,16 +238,39 @@ function createEmbed(oldRank, newRank, points) {
     ? `**${LEAGUE_NAME}** Increased **${difference} position${difference === 1 ? '' : 'i'}** In League LeaderBoard!`
     : `**${LEAGUE_NAME}** Decreased **${difference} position${difference === 1 ? '' : 'i'}** In League LeaderBoard!`;
 
+  const movementFieldName = movedUp
+    ? '⬆️ Overtook'
+    : '⬇️ Overtaken by';
+
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(description)
     .addFields(
-{ name: '⬅️ Previous place', value: formatRank(oldRank), inline: true },
-{ name: '🏆 Current place', value: formatRank(newRank), inline: true },
-{ name: '💎 Points', value: formatNumber(points), inline: true }
+      {
+        name: '⬅️ Previous place',
+        value: formatRank(oldRank),
+        inline: true,
+      },
+      {
+        name: '🏆 Current place',
+        value: formatRank(newRank),
+        inline: true,
+      },
+      {
+        name: '💎 Points',
+        value: formatNumber(points),
+        inline: true,
+      },
+      {
+        name: movementFieldName,
+        value: formatLeagueList(movedLeagues),
+        inline: false,
+      }
     )
     .setTimestamp()
-    .setFooter({ text: 'MGKK League • MADE BY BRAT' });
+    .setFooter({
+      text: 'MGKK League • MADE BY BRAT',
+    });
 
   if (fs.existsSync(LOGO_FILE)) {
     embed.setThumbnail('attachment://logo.png');
@@ -174,20 +279,36 @@ function createEmbed(oldRank, newRank, points) {
   return embed;
 }
 
-async function sendRankChange(oldRank, newRank, points) {
+async function sendRankChange(
+  oldRank,
+  newRank,
+  points,
+  movedLeagues
+) {
   const channel = await client.channels.fetch(CHANNEL_ID);
 
   if (!channel || !channel.isTextBased()) {
-    throw new Error('Discord channel could not be found or is not text-based.');
+    throw new Error(
+      'Discord channel could not be found or is not text-based.'
+    );
   }
 
   const payload = {
-    embeds: [createEmbed(oldRank, newRank, points)],
+    embeds: [
+      createEmbed(
+        oldRank,
+        newRank,
+        points,
+        movedLeagues
+      ),
+    ],
   };
 
   if (fs.existsSync(LOGO_FILE)) {
     payload.files = [
-      new AttachmentBuilder(LOGO_FILE, { name: 'logo.png' }),
+      new AttachmentBuilder(LOGO_FILE, {
+        name: 'logo.png',
+      }),
     ];
   }
 
@@ -195,7 +316,9 @@ async function sendRankChange(oldRank, newRank, points) {
 }
 
 async function checkRank() {
-  console.log(`[${new Date().toISOString()}] Checking ${LEAGUE_NAME}...`);
+  console.log(
+    `[${new Date().toISOString()}] Checking ${LEAGUE_NAME}...`
+  );
 
   const league = await getLeague();
 
@@ -206,51 +329,120 @@ async function checkRank() {
   const points = Number(league.Points || 0);
 
   if (!Number.isFinite(points) || points <= 0) {
-    throw new Error(`Could not read ${LEAGUE_NAME} points.`);
+    throw new Error(
+      `Could not read ${LEAGUE_NAME} points.`
+    );
   }
 
-  const rank = await getLeagueRank();
-  console.log(`${LEAGUE_NAME}: rank ${formatRank(rank)} | ${formatNumber(points)} points`);
+  const { rank, ranking } =
+    await getLeagueRanking();
+
+  console.log(
+    `${LEAGUE_NAME}: rank ${formatRank(rank)} | ${formatNumber(points)} points`
+  );
 
   const state = loadState();
   const now = new Date().toISOString();
 
-  // First run: save the current rank, but don't send a Discord message.
-  if (state.rank === null || !Number.isFinite(Number(state.rank))) {
-    saveState({ rank, points, lastCheck: now });
-    console.log(`Initial rank saved: ${formatRank(rank)}`);
+  // First run or migration from the old state format.
+  if (
+    state.rank === null ||
+    !Number.isFinite(Number(state.rank)) ||
+    !Array.isArray(state.ranking)
+  ) {
+    saveState({
+      rank,
+      points,
+      lastCheck: now,
+      ranking,
+    });
+
+    console.log(
+      `Initial ranking snapshot saved: ${formatRank(rank)}`
+    );
+
     return;
   }
 
   const oldRank = Number(state.rank);
 
   if (oldRank === rank) {
-    // Do not rewrite state.json when nothing relevant changed.
-    // This prevents GitHub Actions from creating a commit every 5 minutes.
-    console.log('Rank unchanged.');
+    // Update the snapshot every check.
+    // This makes the next movement compare against
+    // the immediately previous ranking.
+    saveState({
+      rank,
+      points,
+      lastCheck: now,
+      ranking,
+    });
+
+    console.log(
+      'Rank unchanged. Ranking snapshot updated.'
+    );
+
     return;
   }
 
-  await sendRankChange(oldRank, rank, points);
+  const movedLeagues = getPassedLeagues(
+    oldRank,
+    rank,
+    state.ranking,
+    ranking
+  );
 
-  console.log(`Rank changed: ${formatRank(oldRank)} -> ${formatRank(rank)}`);
-  saveState({ rank, points, lastCheck: now });
+  await sendRankChange(
+    oldRank,
+    rank,
+    points,
+    movedLeagues
+  );
+
+  console.log(
+    `Rank changed: ${formatRank(oldRank)} -> ${formatRank(rank)}`
+  );
+
+  console.log(
+    `${rank < oldRank ? 'Overtook' : 'Overtaken by'}: ${
+      movedLeagues.length
+        ? movedLeagues.join(', ')
+        : 'unknown'
+    }`
+  );
+
+  saveState({
+    rank,
+    points,
+    lastCheck: now,
+    ranking,
+  });
 }
 
 client.once('ready', async () => {
   console.log('====================================');
   console.log('MGKK Discord Bot');
   console.log('====================================');
-  console.log(`Logged in as: ${client.user.tag}`);
-  console.log(`Watching league: ${LEAGUE_NAME}`);
-  console.log(`Channel: ${CHANNEL_ID}`);
-  console.log('Mode: GitHub Actions one-shot check');
+  console.log(
+    `Logged in as: ${client.user.tag}`
+  );
+  console.log(
+    `Watching league: ${LEAGUE_NAME}`
+  );
+  console.log(
+    `Channel: ${CHANNEL_ID}`
+  );
+  console.log(
+    'Mode: GitHub Actions one-shot check'
+  );
   console.log('====================================');
 
   try {
     await checkRank();
   } catch (error) {
-    console.error(`[CHECK ERROR] ${error?.message || error}`);
+    console.error(
+      `[CHECK ERROR] ${error?.message || error}`
+    );
+
     process.exitCode = 1;
   } finally {
     await client.destroy();
@@ -258,20 +450,33 @@ client.once('ready', async () => {
 });
 
 client.on('error', error => {
-  console.error(`[DISCORD ERROR] ${error.message}`);
+  console.error(
+    `[DISCORD ERROR] ${error.message}`
+  );
 });
 
 process.on('unhandledRejection', error => {
-  console.error('[UNHANDLED REJECTION]', error);
+  console.error(
+    '[UNHANDLED REJECTION]',
+    error
+  );
+
   process.exitCode = 1;
 });
 
 process.on('uncaughtException', error => {
-  console.error('[UNCAUGHT EXCEPTION]', error);
+  console.error(
+    '[UNCAUGHT EXCEPTION]',
+    error
+  );
+
   process.exitCode = 1;
 });
 
 client.login(TOKEN).catch(error => {
-  console.error(`[LOGIN ERROR] ${error.message}`);
+  console.error(
+    `[LOGIN ERROR] ${error.message}`
+  );
+
   process.exit(1);
 });
