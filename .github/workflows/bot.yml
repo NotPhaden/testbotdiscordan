@@ -2,7 +2,8 @@ name: MGKK Discord Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: "*/5 * * * *"
+
   workflow_dispatch:
 
 permissions:
@@ -27,16 +28,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js 24
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Check MGKK rank
+      - name: Run MGKK bot
         run: node bot.js
 
       - name: Save updated state
@@ -50,9 +51,7 @@ jobs:
           fi
 
           git add state.json
-
           git commit -m "chore: update MGKK rank state"
 
           git pull --rebase origin main
-
           git push origin main
