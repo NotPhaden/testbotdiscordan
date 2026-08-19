@@ -21,7 +21,6 @@ const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
 const STATE_FILE = path.join(process.cwd(), "state.json");
 
-const SNAPSHOT_INTERVAL = 5 * 60 * 1000;
 const HISTORY_RETENTION = 7 * 24 * 60 * 60 * 1000;
 
 if (!DISCORD_TOKEN) {
@@ -356,15 +355,11 @@ async function getLeagueRank(points, previousRank) {
     }
   }
 
-  console.warn(
-    `Could not find ${LEAGUE_NAME} in inspected leaderboard pages.`
-  );
-
   return null;
 }
 
 /* =========================================================
-   ROBLOX PLAYER NAMES
+   ROBLOX DISPLAY NAMES
 ========================================================= */
 
 async function getRobloxUserProfiles(userIds) {
@@ -407,7 +402,7 @@ async function getRobloxUserProfiles(userIds) {
       }
     } catch (error) {
       console.warn(
-        `Could not resolve Roblox display names for batch ${batch.join(",")}:`,
+        `Could not resolve Roblox display names:`,
         error.message
       );
     }
@@ -417,7 +412,7 @@ async function getRobloxUserProfiles(userIds) {
 }
 
 /* =========================================================
-   MEMBERS / CONTRIBUTIONS
+   MEMBERS
 ========================================================= */
 
 function buildRoster(league) {
@@ -554,19 +549,23 @@ async function buildPlayers(league) {
     return {
       userId: member.userId,
 
+      /*
+       * IMPORTANT:
+       * Roblox Display Name is now the primary name.
+       */
       displayName:
         profile?.displayName ||
-        contribution?.displayName ||
         member.displayName ||
+        contribution?.displayName ||
         profile?.username ||
-        contribution?.username ||
         member.username ||
-        member.userId,
+        contribution?.username ||
+        `Player ${member.userId}`,
 
       username:
         profile?.username ||
-        contribution?.username ||
         member.username ||
+        contribution?.username ||
         null,
 
       points:
@@ -672,10 +671,9 @@ function getDelta(
   currentPoints,
   millisecondsAgo
 ) {
-  const now = Date.now();
-
   const target =
-    now - millisecondsAgo;
+    Date.now() -
+    millisecondsAgo;
 
   const oldPoints =
     getPointsAtOrBefore(
@@ -799,6 +797,7 @@ function downloadBuffer(url) {
 
 /* =========================================================
    SVG DASHBOARD
+   SAME VISUAL STYLE
 ========================================================= */
 
 const PLAYER_COLORS = [
@@ -907,22 +906,6 @@ function makeDashboardSvg({
           stop-color="#171a1f"
         />
       </linearGradient>
-
-      <filter
-        id="shadow"
-        x="-20%"
-        y="-20%"
-        width="140%"
-        height="140%"
-      >
-        <feDropShadow
-          dx="0"
-          dy="8"
-          stdDeviation="12"
-          flood-color="#000000"
-          flood-opacity="0.30"
-        />
-      </filter>
 
     </defs>
 
@@ -1117,8 +1100,6 @@ function makeDashboardSvg({
     );
   }
 
-  /* TABLE HEADER */
-
   svg += makeText(
     170,
     460,
@@ -1283,7 +1264,7 @@ function makeDashboardSvg({
       const name =
         String(
           player.displayName ||
-            player.userId
+            `Player ${player.userId}`
         );
 
       const points =
@@ -1337,6 +1318,11 @@ function makeDashboardSvg({
           fill: white,
         }
       );
+
+      /*
+       * Username / ID stays secondary only.
+       * Display Name is now the main visible name.
+       */
 
       const secondaryIdentity =
         player.username &&
@@ -1541,8 +1527,6 @@ function makeDashboardSvg({
     );
   }
 
-  const now = Date.now();
-
   const labels = [
     {
       x: plotLeft,
@@ -1595,7 +1579,7 @@ function makeDashboardSvg({
 
       if (history.length === 0) {
         points.push({
-          timestamp: now,
+          timestamp: Date.now(),
           value:
             Number(player.points) || 0,
         });
@@ -1618,7 +1602,7 @@ function makeDashboardSvg({
         }
 
         points.push({
-          timestamp: now,
+          timestamp: Date.now(),
           value:
             Number(player.points) || 0,
         });
@@ -1812,12 +1796,10 @@ async function renderDashboard({
 }
 
 /* =========================================================
-   DISCORD
+   DISCORD CHANNEL
 ========================================================= */
 
-async function getDiscordChannel(
-  client
-) {
+async function getDiscordChannel(client) {
   const channel =
     await client.channels.fetch(
       DISCORD_CHANNEL_ID
@@ -1840,6 +1822,10 @@ async function getDiscordChannel(
 
   return channel;
 }
+
+/* =========================================================
+   DASHBOARD MESSAGE
+========================================================= */
 
 async function updateDashboardMessage(
   channel,
@@ -1899,80 +1885,89 @@ async function updateDashboardMessage(
 }
 
 /* =========================================================
-   RANK NOTIFICATION
+   TEXT UPDATE MESSAGE
 ========================================================= */
 
-async function sendRankNotification(
+async function sendUpdateMessage(
   channel,
   league,
   previousRank,
   currentRank
 ) {
-  if (
-    !Number.isFinite(previousRank) ||
-    !Number.isFinite(currentRank)
-  ) {
-    return;
-  }
+  const now = new Date();
+
+  const timestamp =
+    now.toLocaleString(
+      "en-US",
+      {
+        dateStyle: "medium",
+        timeStyle: "short",
+        timeZone: "UTC",
+      }
+    ) + " UTC";
+
+  let title = "🔄 MGKK — Rank Update";
+  let description =
+    "The MGKK leaderboard has been updated.";
+
+  let color = 0x55d7ff;
 
   if (
-    previousRank === currentRank
+    Number.isFinite(previousRank) &&
+    Number.isFinite(currentRank)
   ) {
-    return;
+    if (currentRank < previousRank) {
+      title = "📈 MGKK — Advanced";
+      description =
+        `MGKK has **advanced** from **#${previousRank}** to **#${currentRank}**.`;
+      color = 0x35e0b2;
+    } else if (
+      currentRank > previousRank
+    ) {
+      title = "📉 MGKK — Fell";
+      description =
+        `MGKK has **fallen** from **#${previousRank}** to **#${currentRank}**.`;
+      color = 0xff5f6d;
+    } else {
+      title = "🔄 MGKK — Rank Checked";
+      description =
+        `MGKK remains at **#${currentRank}**.`;
+      color = 0x55d7ff;
+    }
+  } else if (
+    Number.isFinite(currentRank)
+  ) {
+    title = "🚀 MGKK — Rank Detected";
+    description =
+      `MGKK is currently ranked **#${currentRank}**.`;
+    color = 0x55d7ff;
   }
-
-  const difference =
-    previousRank - currentRank;
-
-  const improved =
-    difference > 0;
 
   const embed =
     new EmbedBuilder()
-      .setTitle(
-        improved
-          ? "📈 MGKK — Increased!"
-          : "📉 MGKK — Decreased"
-      )
-      .setDescription(
-        improved
-          ? `**${league.Name}** moved **${Math.abs(
-              difference
-            )} position${
-              Math.abs(difference) === 1
-                ? ""
-                : "s"
-            } up** in the League leaderboard.`
-          : `**${league.Name}** moved **${Math.abs(
-              difference
-            )} position${
-              Math.abs(difference) === 1
-                ? ""
-                : "s"
-            } down** in the League leaderboard.`
-      )
-      .addFields(
-        {
-          name: "⬅️ Previous place",
-          value: `#${previousRank}`,
-          inline: true,
-        },
-        {
-          name: "🏆 Current place",
-          value: `#${currentRank}`,
-          inline: true,
-        },
-        {
-          name: "💎 Points",
-          value:
-            formatFullPoints(
-              Number(
-                league.Points
-              ) || 0
-            ),
-          inline: true,
-        }
-      )
+      .setColor(color)
+      .setTitle(title)
+      .setDescription(description)
+      .addFields({
+        name: "🏆 Current Rank",
+        value: currentRank
+          ? `#${currentRank}`
+          : "Unknown",
+        inline: true,
+      })
+      .addFields({
+        name: "💎 League Points",
+        value:
+          formatFullPoints(
+            Number(league.Points) || 0
+          ),
+        inline: true,
+      })
+      .addFields({
+        name: "🕐 Updated",
+        value: timestamp,
+        inline: true,
+      })
       .setFooter({
         text:
           "MGKK League • BIG Games API",
@@ -2078,36 +2073,36 @@ async function main() {
         client
       );
 
+    /*
+     * Send a separate English status message
+     * so every update is easy to identify.
+     */
+    await sendUpdateMessage(
+      channel,
+      league,
+      state.previousRank,
+      currentRank
+    );
+
+    /*
+     * Keep the beautiful dashboard image
+     * exactly as before.
+     */
+    await renderAndUpdate(
+      channel,
+      state,
+      league,
+      players,
+      currentRank
+    );
+
     if (
       currentRank !== null &&
-      Number.isFinite(
-        currentRank
-      )
+      Number.isFinite(currentRank)
     ) {
-      await sendRankNotification(
-        channel,
-        league,
-        state.previousRank,
-        currentRank
-      );
-
       state.previousRank =
         currentRank;
     }
-
-    const pngBuffer =
-      await renderDashboard({
-        league,
-        rank: currentRank,
-        players,
-        state,
-      });
-
-    await updateDashboardMessage(
-      channel,
-      state,
-      pngBuffer
-    );
   } finally {
     client.destroy();
   }
@@ -2116,6 +2111,32 @@ async function main() {
 
   console.log(
     "MGKK check completed successfully."
+  );
+}
+
+/* =========================================================
+   RENDER + UPDATE
+========================================================= */
+
+async function renderAndUpdate(
+  channel,
+  state,
+  league,
+  players,
+  currentRank
+) {
+  const pngBuffer =
+    await renderDashboard({
+      league,
+      rank: currentRank,
+      players,
+      state,
+    });
+
+  await updateDashboardMessage(
+    channel,
+    state,
+    pngBuffer
   );
 }
 
