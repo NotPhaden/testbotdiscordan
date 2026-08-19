@@ -2,7 +2,7 @@ name: MGKK Discord Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -31,10 +31,34 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
+      - name: Check MGKK rank
+        run: node bot.js
+
+      - name: Save updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Checking state.json..."
+
+          if git diff --quiet -- state.json; then
+            echo "state.json did not change."
+            exit 0
+          fi
+
+          echo "state.json changed:"
+          git diff --stat -- state.json
+
+          git add state.json
+
+          git commit -m "chore: update MGKK rank state"
+
+          git push origin HEAD:main
       - name: Check MGKK rank
         run: node bot.js
 
