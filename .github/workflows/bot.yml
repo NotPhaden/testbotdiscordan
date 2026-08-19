@@ -34,7 +34,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Check MGKK rank
         run: node bot.js
@@ -50,7 +50,9 @@ jobs:
           fi
 
           git add state.json
+
           git commit -m "chore: update MGKK rank state"
 
           git pull --rebase origin main
+
           git push origin main
