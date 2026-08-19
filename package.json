@@ -1,6 +1,6 @@
 {
   "name": "mgkk-discord-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MGKK League Discord rank monitor",
   "main": "bot.js",
   "scripts": {
@@ -12,6 +12,6 @@
   "dependencies": {
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.1",
-    "sharp": "^0.34.0"
+    "sharp": "0.34.5"
   }
 }
