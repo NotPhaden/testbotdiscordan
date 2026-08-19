@@ -22,12 +22,12 @@ const LOGO_FILE = path.join(__dirname, 'logo.png');
 const CARD_FILE = path.join(__dirname, 'league-card.png');
 
 if (!TOKEN) {
-  console.error('Missing DISCORD_TOKEN.');
+  console.error('Missing DISCORD_TOKEN');
   process.exit(1);
 }
 
 if (!CHANNEL_ID) {
-  console.error('Missing DISCORD_CHANNEL_ID.');
+  console.error('Missing DISCORD_CHANNEL_ID');
   process.exit(1);
 }
 
@@ -43,10 +43,10 @@ function defaultState() {
   return {
     rank: null,
     points: null,
-    lastCheck: null,
-    ranking: null,
+    ranking: [],
     history: [],
     dashboardMessageId: null,
+    lastCheck: null,
   };
 }
 
@@ -56,20 +56,23 @@ function loadState() {
       return defaultState();
     }
 
-    const state = JSON.parse(
+    const parsed = JSON.parse(
       fs.readFileSync(STATE_FILE, 'utf8')
     );
 
     return {
       ...defaultState(),
-      ...state,
-      history: Array.isArray(state.history)
-        ? state.history
+      ...parsed,
+      ranking: Array.isArray(parsed.ranking)
+        ? parsed.ranking
+        : [],
+      history: Array.isArray(parsed.history)
+        ? parsed.history
         : [],
     };
   } catch (error) {
     console.error(
-      `[STATE] Could not read state.json: ${error.message}`
+      `[STATE] ${error.message}`
     );
 
     return defaultState();
@@ -77,28 +80,28 @@ function loadState() {
 }
 
 function saveState(state) {
-  const tempFile = `${STATE_FILE}.tmp`;
+  const temp = `${STATE_FILE}.tmp`;
 
   fs.writeFileSync(
-    tempFile,
+    temp,
     JSON.stringify(state, null, 2) + '\n',
     'utf8'
   );
 
-  fs.renameSync(tempFile, STATE_FILE);
+  fs.renameSync(temp, STATE_FILE);
 }
 
 /* =========================================================
-   API
+   BIG GAMES API
 ========================================================= */
 
-async function api(pathname) {
+async function api(endpoint) {
   const response = await fetch(
-    `${API_BASE}${pathname}`,
+    `${API_BASE}${endpoint}`,
     {
       headers: {
         accept: 'application/json',
-        'user-agent': 'MGKK-Discord-Bot/5.0',
+        'user-agent: 'MGKK-Discord-Bot/7.0',
       },
       signal: AbortSignal.timeout(15000),
     }
@@ -109,25 +112,27 @@ async function api(pathname) {
   let json;
 
   try {
-    json = text ? JSON.parse(text) : null;
+    json = text
+      ? JSON.parse(text)
+      : null;
   } catch {
     throw new Error(
-      `Invalid API response (${response.status})`
+      `Invalid API response: ${response.status}`
     );
   }
 
   if (!response.ok) {
     throw new Error(
       json?.error?.message ||
-      json?.message ||
-      `BIG Games API returned ${response.status}`
+        json?.message ||
+        `API error ${response.status}`
     );
   }
 
   if (json?.status === 'error') {
     throw new Error(
       json?.error?.message ||
-      'BIG Games API returned an error.'
+        'BIG Games API error'
     );
   }
 
@@ -135,11 +140,13 @@ async function api(pathname) {
 }
 
 async function getLeague() {
-  const response = await api(
-    `/leagues/${encodeURIComponent(LEAGUE_NAME)}`
+  const result = await api(
+    `/leagues/${encodeURIComponent(
+      LEAGUE_NAME
+    )}`
   );
 
-  return response?.data ?? response;
+  return result?.data ?? result;
 }
 
 async function getLeagueRanking() {
@@ -147,19 +154,17 @@ async function getLeagueRanking() {
   const ranking = [];
 
   for (let page = 1; page <= 10000; page++) {
-    const response = await api(
+    const result = await api(
       `/leagues/?page=${page}&pageSize=${pageSize}&sort=Points&sortOrder=desc`
     );
 
-    const data = response?.data;
+    const leagues = result?.data?.leagues;
 
-    if (!data || !Array.isArray(data.leagues)) {
+    if (!Array.isArray(leagues)) {
       throw new Error(
-        'Invalid league listing response.'
+        'Invalid league ranking response'
       );
     }
-
-    const leagues = data.leagues;
 
     if (leagues.length === 0) {
       break;
@@ -180,26 +185,1487 @@ async function getLeagueRanking() {
     }
   }
 
-  const exactIndex = ranking.findIndex(
+  const index = ranking.findIndex(
     name =>
       name.toLowerCase() ===
       LEAGUE_NAME.toLowerCase()
   );
 
-  if (exactIndex === -1) {
+  if (index === -1) {
     throw new Error(
-      `Could not find ${LEAGUE_NAME} in the league rankings.`
+      `${LEAGUE_NAME} was not found in leaderboard`
     );
   }
 
   return {
-    rank: exactIndex + 1,
+    rank: index + 1,
     ranking,
   };
 }
 
 /* =========================================================
-   RANK MOVEMENT
+   ROBLOX USER LOOKUP
+========================================================= */
+
+async function getRobloxUsers(userIds) {
+  const uniqueIds = [
+    ...new Set(
+      userIds
+        .map(id => Number(id))
+        .filter(
+          id =>
+            Number.isInteger(id) &&
+            id > 0
+        )
+    ),
+  ];
+
+  const users = new Map();
+
+  for (
+    let i = 0;
+    i < uniqueIds.length;
+    i += 50
+  ) {
+    const batch = uniqueIds.slice(
+      i,
+      i + 50
+    );
+
+    try {
+      const response = await fetch(
+        'https://users.roblox.com/v1/users',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type':
+              'application/json',
+            accept:
+              'application/json',
+          },
+          body: JSON.stringify({
+            userIds: batch,
+            excludeBannedUsers: false,
+          }),
+          signal:
+            AbortSignal.timeout(10000),
+        }
+      );
+
+      if (!response.ok) {
+        console.warn(
+          `[ROBLOX] User lookup failed: ${response.status}`
+        );
+        continue;
+      }
+
+      const json =
+        await response.json();
+
+      for (const user of json?.data || []) {
+        users.set(
+          String(user.id),
+          {
+            username:
+              user.name ||
+              String(user.id),
+
+            displayName:
+              user.displayName ||
+              user.name ||
+              String(user.id),
+          }
+        );
+      }
+    } catch (error) {
+      console.warn(
+        `[ROBLOX] ${error.message}`
+      );
+    }
+  }
+
+  return users;
+}
+
+/* =========================================================
+   CONTRIBUTORS
+========================================================= */
+
+async function getContributors(
+  league
+) {
+  const pointContributions =
+    Array.isArray(
+      league?.PointContributions
+    )
+      ? league.PointContributions
+      : [];
+
+  const owner =
+    league?.Owner &&
+    league.Owner.UserID != null
+      ? league.Owner
+      : null;
+
+  const members =
+    Array.isArray(league?.Members)
+      ? league.Members
+      : [];
+
+  /*
+   * Roster = Owner + Members
+   */
+  const roster = new Map();
+
+  if (owner) {
+    roster.set(
+      String(owner.UserID),
+      {
+        userId: owner.UserID,
+        name:
+          owner.DisplayName ||
+          owner.Username ||
+          null,
+      }
+    );
+  }
+
+  for (const member of members) {
+    if (member?.UserID == null) {
+      continue;
+    }
+
+    roster.set(
+      String(member.UserID),
+      {
+        userId: member.UserID,
+        name:
+          member.DisplayName ||
+          member.Username ||
+          null,
+      }
+    );
+  }
+
+  /*
+   * PointContributions = authoritative points.
+   */
+  const contributionMap = new Map();
+
+  for (const contribution of pointContributions) {
+    if (contribution?.UserID == null) {
+      continue;
+    }
+
+    contributionMap.set(
+      String(contribution.UserID),
+      {
+        userId:
+          contribution.UserID,
+
+        points:
+          Number(
+            contribution.Points || 0
+          ),
+
+        timestamp:
+          Number(
+            contribution.Timestamp || 0
+          ),
+
+        name:
+          contribution.DisplayName ||
+          contribution.Username ||
+          null,
+      }
+    );
+  }
+
+  /*
+   * Make sure all roster members exist,
+   * even if they have 0 contribution.
+   */
+  const contributors = [];
+
+  for (const [id, member] of roster) {
+    const contribution =
+      contributionMap.get(id);
+
+    contributors.push({
+      userId:
+        member.userId,
+
+      name:
+        contribution?.name ||
+        member.name ||
+        null,
+
+      points:
+        Number(
+          contribution?.points || 0
+        ),
+
+      timestamp:
+        Number(
+          contribution?.timestamp || 0
+        ),
+    });
+  }
+
+  /*
+   * Resolve missing numeric names through Roblox.
+   */
+  const missingIds =
+    contributors
+      .filter(
+        member =>
+          !member.name ||
+          /^\d+$/.test(
+            String(member.name)
+          )
+      )
+      .map(
+        member => member.userId
+      );
+
+  const robloxUsers =
+    await getRobloxUsers(
+      missingIds
+    );
+
+  for (const member of contributors) {
+    const user =
+      robloxUsers.get(
+        String(member.userId)
+      );
+
+    if (user) {
+      member.name =
+        user.displayName ||
+        user.username;
+    }
+
+    if (!member.name) {
+      member.name =
+        `User ${member.userId}`;
+    }
+  }
+
+  contributors.sort(
+    (a, b) =>
+      b.points - a.points
+  );
+
+  return contributors;
+}
+
+/* =========================================================
+   FORMATTERS
+========================================================= */
+
+function formatNumber(value) {
+  return Number(
+    value || 0
+  ).toLocaleString('en-US');
+}
+
+function formatCompact(value) {
+  const n = Number(value || 0);
+
+  if (!Number.isFinite(n)) {
+    return '0';
+  }
+
+  if (Math.abs(n) >= 1e9) {
+    return `${(
+      n / 1e9
+    ).toFixed(2)}b`;
+  }
+
+  if (Math.abs(n) >= 1e6) {
+    return `${(
+      n / 1e6
+    ).toFixed(2)}m`;
+  }
+
+  if (Math.abs(n) >= 1e3) {
+    return `${(
+      n / 1e3
+    ).toFixed(2)}k`;
+  }
+
+  return `${Math.round(n)}`;
+}
+
+function formatRank(rank) {
+  return `#${formatNumber(rank)}`;
+}
+
+function formatDelta(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return '—';
+  }
+
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return '—';
+  }
+
+  if (n === 0) {
+    return '0';
+  }
+
+  return `${
+    n > 0 ? '+' : ''
+  }${formatCompact(n)}`;
+}
+
+function xmlEscape(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(
+      /</g,
+      '&lt;'
+    )
+    .replace(
+      />/g,
+      '&gt;'
+    )
+    .replace(
+      /"/g,
+      '&quot;'
+    )
+    .replace(
+      /'/g,
+      '&apos;'
+    );
+}
+
+function shorten(value, max) {
+  const text =
+    String(value ?? '');
+
+  if (text.length <= max) {
+    return text;
+  }
+
+  return `${text.slice(
+    0,
+    max - 1
+  )}…`;
+}
+
+/* =========================================================
+   HISTORY
+========================================================= */
+
+function createSnapshot(
+  league,
+  contributors
+) {
+  return {
+    timestamp:
+      Date.now(),
+
+    points:
+      Number(
+        league.Points || 0
+      ),
+
+    members:
+      contributors.map(
+        member => ({
+          userId:
+            member.userId,
+
+          name:
+            member.name,
+
+          points:
+            member.points,
+        })
+      ),
+  };
+}
+
+function trimHistory(history) {
+  const cutoff =
+    Date.now() -
+    72 * 60 * 60 * 1000;
+
+  return history
+    .filter(
+      item =>
+        Number(
+          item.timestamp
+        ) >= cutoff
+    )
+    .slice(-1000);
+}
+
+function getMemberDelta(
+  history,
+  userId,
+  hoursAgo
+) {
+  if (!history.length) {
+    return null;
+  }
+
+  const current =
+    history[
+      history.length - 1
+    ];
+
+  const currentMember =
+    current.members?.find(
+      member =>
+        String(
+          member.userId
+        ) ===
+        String(userId)
+    );
+
+  if (!currentMember) {
+    return null;
+  }
+
+  const target =
+    Date.now() -
+    hoursAgo *
+      60 *
+      60 *
+      1000;
+
+  let best = null;
+  let bestDistance =
+    Infinity;
+
+  for (const snapshot of history) {
+    const timestamp =
+      Number(
+        snapshot.timestamp
+      );
+
+    if (
+      timestamp > target
+    ) {
+      continue;
+    }
+
+    const distance =
+      Math.abs(
+        timestamp - target
+      );
+
+    if (
+      distance <
+      bestDistance
+    ) {
+      best = snapshot;
+      bestDistance =
+        distance;
+    }
+  }
+
+  if (!best) {
+    return null;
+  }
+
+  const oldMember =
+    best.members?.find(
+      member =>
+        String(
+          member.userId
+        ) ===
+        String(userId)
+    );
+
+  if (!oldMember) {
+    return null;
+  }
+
+  return (
+    Number(
+      currentMember.points || 0
+    ) -
+    Number(
+      oldMember.points || 0
+    )
+  );
+}
+
+/* =========================================================
+   ROBLOX AVATAR
+========================================================= */
+
+async function getAvatar(
+  userId
+) {
+  try {
+    /*
+     * IMPORTANT:
+     * thumbnails endpoint returns JSON.
+     * We first read imageUrl, then download
+     * the actual PNG.
+     */
+    const response = await fetch(
+      'https://thumbnails.roblox.com/v1/users/avatar-headshot' +
+        `?userIds=${encodeURIComponent(
+          userId
+        )}` +
+        '&size=150x150' +
+        '&format=Png' +
+        '&isCircular=true',
+      {
+        headers: {
+          accept:
+            'application/json',
+        },
+        signal:
+          AbortSignal.timeout(10000),
+      }
+    );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const json =
+      await response.json();
+
+    const imageUrl =
+      json?.data?.[0]?.imageUrl;
+
+    if (!imageUrl) {
+      return null;
+    }
+
+    const imageResponse =
+      await fetch(
+        imageUrl,
+        {
+          signal:
+            AbortSignal.timeout(10000),
+        }
+      );
+
+    if (!imageResponse.ok) {
+      return null;
+    }
+
+    const buffer =
+      Buffer.from(
+        await imageResponse.arrayBuffer()
+      );
+
+    return await sharp(buffer)
+      .resize(64, 64, {
+        fit: 'cover',
+      })
+      .png()
+      .toBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/* =========================================================
+   LEAGUE ICON
+========================================================= */
+
+async function getLeagueIcon(
+  icon
+) {
+  const match =
+    String(icon || '').match(
+      /rbxassetid:\/\/(\d+)/i
+    );
+
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const response =
+      await fetch(
+        'https://thumbnails.roblox.com/v1/assets' +
+          `?assetIds=${match[1]}` +
+          '&returnPolicy=PlaceHolder' +
+          '&size=420x420' +
+          '&format=Png' +
+          '&isCircular=false',
+        {
+          headers: {
+            accept:
+              'application/json',
+          },
+          signal:
+            AbortSignal.timeout(10000),
+        }
+      );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const json =
+      await response.json();
+
+    const imageUrl =
+      json?.data?.[0]?.imageUrl;
+
+    if (!imageUrl) {
+      return null;
+    }
+
+    const image =
+      await fetch(
+        imageUrl,
+        {
+          signal:
+            AbortSignal.timeout(10000),
+        }
+      );
+
+    if (!image.ok) {
+      return null;
+    }
+
+    return Buffer.from(
+      await image.arrayBuffer()
+    );
+  } catch {
+    return null;
+  }
+}
+
+/* =========================================================
+   DASHBOARD IMAGE
+   NO NESTED SVG
+========================================================= */
+
+async function makeLeagueCard(
+  league,
+  contributors,
+  history,
+  rank
+) {
+  const width = 1400;
+
+  const headerHeight = 205;
+  const rowHeight = 82;
+  const tableHeaderHeight = 50;
+  const gap = 25;
+
+  const chartHeight = 400;
+
+  const tableHeight =
+    tableHeaderHeight +
+    contributors.length *
+      rowHeight;
+
+  const chartTop =
+    headerHeight +
+    tableHeight +
+    gap;
+
+  const height =
+    chartTop +
+    chartHeight +
+    30;
+
+  const colors = [
+    '#14c7ff',
+    '#ff3baa',
+    '#ffae1a',
+    '#39dfaa',
+  ];
+
+  const avatars =
+    await Promise.all(
+      contributors.map(
+        member =>
+          getAvatar(
+            member.userId
+          )
+      )
+    );
+
+  /*
+   * Chart is drawn DIRECTLY inside this SVG.
+   * No SVG inside SVG.
+   */
+
+  const chartLeft = 85;
+  const chartRight = 40;
+  const chartTopInner =
+    chartTop + 45;
+  const chartBottom =
+    chartTop + chartHeight - 45;
+
+  const chartWidth =
+    width -
+    chartLeft -
+    chartRight;
+
+  const chartUsableHeight =
+    chartBottom -
+    chartTopInner;
+
+  const snapshots =
+    history.slice(-25);
+
+  const maxValue =
+    Math.max(
+      1,
+      ...snapshots.flatMap(
+        snapshot =>
+          (
+            snapshot.members ||
+            []
+          ).map(
+            member =>
+              Number(
+                member.points || 0
+              )
+          )
+      )
+    );
+
+  const yMax =
+    Math.ceil(
+      maxValue /
+        500000
+    ) *
+      500000 ||
+    maxValue;
+
+  function chartX(index) {
+    if (snapshots.length <= 1) {
+      return (
+        chartLeft +
+        chartWidth / 2
+      );
+    }
+
+    return (
+      chartLeft +
+      (index /
+        (snapshots.length -
+          1)) *
+        chartWidth
+    );
+  }
+
+  function chartY(value) {
+    return (
+      chartBottom -
+      (Number(value || 0) /
+        yMax) *
+        chartUsableHeight
+    );
+  }
+
+  const grid = [];
+
+  for (
+    let i = 0;
+    i <= 5;
+    i++
+  ) {
+    const value =
+      (yMax / 5) * i;
+
+    const y =
+      chartY(value);
+
+    grid.push(`
+      <line
+        x1="${chartLeft}"
+        y1="${y}"
+        x2="${chartLeft + chartWidth}"
+        y2="${y}"
+        stroke="#303238"
+        stroke-width="1"
+      />
+
+      <text
+        x="${chartLeft - 12}"
+        y="${y + 5}"
+        text-anchor="end"
+        fill="#858891"
+        font-size="15"
+        font-family="Arial"
+      >
+        ${xmlEscape(
+          formatCompact(
+            value
+          )
+        )}
+      </text>
+    `);
+  }
+
+  const chartSeries =
+    contributors
+      .map(
+        (member, seriesIndex) => {
+          const color =
+            colors[
+              seriesIndex %
+                colors.length
+            ];
+
+          const values =
+            snapshots.map(
+              snapshot => {
+                const found =
+                  snapshot.members?.find(
+                    item =>
+                      String(
+                        item.userId
+                      ) ===
+                      String(
+                        member.userId
+                      )
+                  );
+
+                return Number(
+                  found?.points || 0
+                );
+              }
+            );
+
+          if (!values.length) {
+            return '';
+          }
+
+          const linePoints =
+            values
+              .map(
+                (
+                  value,
+                  index
+                ) =>
+                  `${chartX(
+                    index
+                  )},${chartY(
+                    value
+                  )}`
+              )
+              .join(' ');
+
+          const areaPoints =
+            `${chartX(0)},${chartBottom} ` +
+            linePoints +
+            ` ${chartX(
+              values.length - 1
+            )},${chartBottom}`;
+
+          const dots =
+            values
+              .map(
+                (
+                  value,
+                  index
+                ) =>
+                  `
+                  <circle
+                    cx="${chartX(
+                      index
+                    )}"
+                    cy="${chartY(
+                      value
+                    )}"
+                    r="4"
+                    fill="${color}"
+                  />
+                  `
+              )
+              .join('');
+
+          return `
+            <polygon
+              points="${areaPoints}"
+              fill="${color}"
+              opacity="0.08"
+            />
+
+            <polyline
+              points="${linePoints}"
+              fill="none"
+              stroke="${color}"
+              stroke-width="3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+
+            ${dots}
+          `;
+        }
+      )
+      .join('');
+
+  const chartLabels =
+    snapshots
+      .map(
+        (snapshot, index) => {
+          if (
+            snapshots.length >
+              12 &&
+            index % 2 !== 0
+          ) {
+            return '';
+          }
+
+          const hours =
+            Math.round(
+              (Date.now() -
+                Number(
+                  snapshot.timestamp
+                )) /
+                3600000
+            );
+
+          const label =
+            hours <= 0
+              ? 'Now'
+              : `${hours}h`;
+
+          return `
+            <text
+              x="${chartX(index)}"
+              y="${chartBottom + 30}"
+              text-anchor="middle"
+              fill="#858891"
+              font-size="13"
+              font-family="Arial"
+            >
+              ${label}
+            </text>
+          `;
+        }
+      )
+      .join('');
+
+  /* =======================================================
+     HEADER
+  ======================================================= */
+
+  const leaguePoints =
+    Number(
+      league.Points || 0
+    );
+
+  const level =
+    Number(
+      league.Level || 1
+    );
+
+  const owner =
+    league.Owner?.DisplayName ||
+    league.Owner?.Username ||
+    'Unknown';
+
+  const capacity =
+    Number(
+      league.MemberCapacity ||
+        contributors.length ||
+        4
+    );
+
+  /* =======================================================
+     TABLE
+  ======================================================= */
+
+  const tableStart =
+    headerHeight;
+
+  const tableHeaderY =
+    tableStart + 31;
+
+  const rowStart =
+    tableStart +
+    tableHeaderHeight;
+
+  const tableHeaders = `
+    <text
+      x="35"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      #
+    </text>
+
+    <text
+      x="115"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      PLAYER
+    </text>
+
+    <text
+      x="650"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      POINTS
+    </text>
+
+    <text
+      x="810"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      +1H
+    </text>
+
+    <text
+      x="920"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      +24H
+    </text>
+
+    <text
+      x="1050"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      LAST
+    </text>
+
+    <text
+      x="1205"
+      y="${tableHeaderY}"
+      fill="#8f9199"
+      font-size="15"
+      font-weight="700"
+      font-family="Arial"
+    >
+      SHARE
+    </text>
+  `;
+
+  const rows =
+    contributors
+      .map(
+        (member, index) => {
+          const y =
+            rowStart +
+            index * rowHeight;
+
+          const color =
+            colors[
+              index %
+                colors.length
+            ];
+
+          const delta1h =
+            getMemberDelta(
+              history,
+              member.userId,
+              1
+            );
+
+          const delta24h =
+            getMemberDelta(
+              history,
+              member.userId,
+              24
+            );
+
+          const share =
+            leaguePoints > 0
+              ? (member.points /
+                  leaguePoints) *
+                100
+              : 0;
+
+          const avatar =
+            avatars[index];
+
+          const avatarSvg =
+            avatar
+              ? `
+                <image
+                  href="data:image/png;base64,${avatar.toString(
+                    'base64'
+                  )}"
+                  x="48"
+                  y="${y + 9}"
+                  width="62"
+                  height="62"
+                />
+              `
+              : `
+                <circle
+                  cx="79"
+                  cy="${y + 40}"
+                  r="31"
+                  fill="#373940"
+                />
+              `;
+
+          return `
+            <rect
+              x="20"
+              y="${y}"
+              width="${width - 40}"
+              height="${rowHeight - 4}"
+              rx="10"
+              fill="#202428"
+            />
+
+            <rect
+              x="20"
+              y="${y}"
+              width="5"
+              height="${rowHeight - 4}"
+              rx="2"
+              fill="${color}"
+            />
+
+            <text
+              x="35"
+              y="${y + 48}"
+              fill="${color}"
+              font-size="20"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ${index + 1}
+            </text>
+
+            ${avatarSvg}
+
+            <text
+              x="125"
+              y="${y + 48}"
+              fill="#f1f2f4"
+              font-size="21"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ${xmlEscape(
+                shorten(
+                  member.name,
+                  28
+                )
+              )}
+            </text>
+
+            <text
+              x="650"
+              y="${y + 48}"
+              fill="${color}"
+              font-size="21"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ★ ${xmlEscape(
+                formatCompact(
+                  member.points
+                )
+              )}
+            </text>
+
+            <text
+              x="810"
+              y="${y + 48}"
+              fill="#f1f2f4"
+              font-size="20"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ${xmlEscape(
+                formatDelta(
+                  delta1h
+                )
+              )}
+            </text>
+
+            <text
+              x="920"
+              y="${y + 48}"
+              fill="#f1f2f4"
+              font-size="20"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ${xmlEscape(
+                formatDelta(
+                  delta24h
+                )
+              )}
+            </text>
+
+            <text
+              x="1050"
+              y="${y + 48}"
+              fill="#dfe0e4"
+              font-size="20"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ${member.timestamp
+                ? new Date(
+                    member.timestamp *
+                      1000
+                  ).toLocaleTimeString(
+                    'en-GB',
+                    {
+                      hour: '2-digit',
+                      minute:
+                        '2-digit',
+                    }
+                  )
+                : '—'}
+            </text>
+
+            <text
+              x="1205"
+              y="${y + 48}"
+              fill="${color}"
+              font-size="20"
+              font-weight="700"
+              font-family="Arial"
+            >
+              ${share.toFixed(
+                1
+              )}%
+            </text>
+          `;
+        }
+      )
+      .join('');
+
+  /* =======================================================
+     FINAL SVG
+  ======================================================= */
+
+  const svg = `
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="${width}"
+      height="${height}"
+      viewBox="0 0 ${width} ${height}"
+    >
+
+      <rect
+        width="${width}"
+        height="${height}"
+        rx="22"
+        fill="#1b1d20"
+      />
+
+      <rect
+        x="10"
+        y="10"
+        width="${width - 20}"
+        height="${height - 20}"
+        rx="22"
+        fill="#24272b"
+      />
+
+      <!-- HEADER -->
+
+      <text
+        x="45"
+        y="58"
+        fill="#f2f3f5"
+        font-size="34"
+        font-weight="800"
+        font-family="Arial"
+      >
+        ${xmlEscape(
+          league.Name ||
+            LEAGUE_NAME
+        )}
+      </text>
+
+      <text
+        x="45"
+        y="101"
+        fill="#cfd1d6"
+        font-size="20"
+        font-family="Arial"
+      >
+        Global Rank
+      </text>
+
+      <text
+        x="45"
+        y="137"
+        fill="#ffffff"
+        font-size="28"
+        font-weight="800"
+        font-family="Arial"
+      >
+        ${formatRank(rank)}
+      </text>
+
+      <text
+        x="255"
+        y="101"
+        fill="#cfd1d6"
+        font-size="20"
+        font-family="Arial"
+      >
+        League Points
+      </text>
+
+      <text
+        x="255"
+        y="137"
+        fill="#ffffff"
+        font-size="28"
+        font-weight="800"
+        font-family="Arial"
+      >
+        ${formatNumber(
+          leaguePoints
+        )}
+      </text>
+
+      <text
+        x="520"
+        y="101"
+        fill="#cfd1d6"
+        font-size="20"
+        font-family="Arial"
+      >
+        Level
+      </text>
+
+      <text
+        x="520"
+        y="137"
+        fill="#ffffff"
+        font-size="28"
+        font-weight="800"
+        font-family="Arial"
+      >
+        ${level}
+      </text>
+
+      <text
+        x="690"
+        y="101"
+        fill="#cfd1d6"
+        font-size="20"
+        font-family="Arial"
+      >
+        Members
+      </text>
+
+      <text
+        x="690"
+        y="137"
+        fill="#ffffff"
+        font-size="28"
+        font-weight="800"
+        font-family="Arial"
+      >
+        ${contributors.length}/${capacity}
+      </text>
+
+      <text
+        x="900"
+        y="101"
+        fill="#cfd1d6"
+        font-size="20"
+        font-family="Arial"
+      >
+        Owner
+      </text>
+
+      <text
+        x="900"
+        y="137"
+        fill="#ffffff"
+        font-size="22"
+        font-weight="700"
+        font-family="Arial"
+      >
+        ${xmlEscape(
+          shorten(owner, 24)
+        )}
+      </text>
+
+      <line
+        x1="35"
+        y1="165"
+        x2="${width - 35}"
+        y2="165"
+        stroke="#3b3d42"
+        stroke-width="1"
+      />
+
+      <!-- TABLE -->
+
+      ${tableHeaders}
+
+      ${rows}
+
+      <!-- CHART -->
+
+      <text
+        x="45"
+        y="${chartTop + 25}"
+        fill="#f0f1f4"
+        font-size="20"
+        font-weight="700"
+        font-family="Arial"
+      >
+        Contribution History
+      </text>
+
+      ${grid.join('')}
+
+      ${chartSeries}
+
+      ${chartLabels}
+
+    </svg>
+  `;
+
+  await sharp(
+    Buffer.from(svg)
+  )
+    .png()
+    .toFile(CARD_FILE);
+
+  return CARD_FILE;
+}
+
+/* =========================================================
+   RANK CHANGE
 ========================================================= */
 
 function getPassedLeagues(
@@ -228,1342 +1694,96 @@ function getPassedLeagues(
   );
 }
 
-/* =========================================================
-   FORMATTING
-========================================================= */
-
-function formatNumber(value) {
-  return Number(value || 0).toLocaleString(
-    'en-US'
-  );
-}
-
-function formatRank(rank) {
-  return `#${formatNumber(rank)}`;
-}
-
-function formatCompact(value) {
-  const n = Number(value || 0);
-
-  if (!Number.isFinite(n)) {
-    return '0';
-  }
-
-  if (Math.abs(n) >= 1e9) {
-    return `${(n / 1e9).toFixed(2)}b`;
-  }
-
-  if (Math.abs(n) >= 1e6) {
-    return `${(n / 1e6).toFixed(2)}m`;
-  }
-
-  if (Math.abs(n) >= 1e3) {
-    return `${(n / 1e3).toFixed(2)}k`;
-  }
-
-  return `${Math.round(n)}`;
-}
-
-function formatDelta(value) {
-  if (value === null || value === undefined) {
-    return '—';
-  }
-
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return '—';
-  }
-
-  if (n === 0) {
-    return '0';
-  }
-
-  return `${n > 0 ? '+' : ''}${formatCompact(n)}`;
-}
-
-function formatHoursSince(unixSeconds) {
-  if (!unixSeconds) {
-    return '—';
-  }
-
-  const hours = Math.max(
-    0,
-    (Date.now() -
-      Number(unixSeconds) * 1000) /
-      3600000
-  );
-
-  if (hours < 1) {
-    return `${Math.round(hours * 60)}m`;
-  }
-
-  return `${Math.floor(hours)}h`;
-}
-
-function formatSnapshotAge(timestamp) {
-  const ms = Math.max(
-    0,
-    Date.now() - Number(timestamp)
-  );
-
-  const minutes = Math.floor(
-    ms / 60000
-  );
-
-  if (minutes < 1) {
-    return 'just now';
-  }
-
-  if (minutes < 60) {
-    return `${minutes} minute${
-      minutes === 1 ? '' : 's'
-    } ago`;
-  }
-
-  const hours = Math.floor(
-    minutes / 60
-  );
-
-  return `${hours} hour${
-    hours === 1 ? '' : 's'
-  } ago`;
-}
-
-function xmlEscape(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-function shorten(value, max) {
-  const text = String(value ?? '');
-
-  return text.length > max
-    ? `${text.slice(0, max - 1)}…`
-    : text;
-}
-
-/* =========================================================
-   ROBLOX IMAGES
-========================================================= */
-
-function avatarUrl(userId) {
-  return (
-    'https://thumbnails.roblox.com/v1/users/avatar-headshot' +
-    `?userIds=${encodeURIComponent(userId)}` +
-    '&size=150x150' +
-    '&format=Png' +
-    '&isCircular=true'
-  );
-}
-
-async function fetchBuffer(url) {
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'user-agent': 'MGKK-Discord-Bot/5.0',
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    return Buffer.from(
-      await response.arrayBuffer()
-    );
-  } catch {
-    return null;
-  }
-}
-
-async function resolveAvatar(userId) {
-  const response = await fetchBuffer(
-    avatarUrl(userId)
-  );
-
-  if (!response) {
-    return null;
-  }
-
-  try {
-    return await sharp(response)
-      .resize(64, 64, {
-        fit: 'cover',
-      })
-      .png()
-      .toBuffer();
-  } catch {
-    return null;
-  }
-}
-
-async function resolveLeagueIcon(icon) {
-  const match = String(icon || '').match(
-    /rbxassetid:\/\/(\d+)/i
-  );
-
-  if (!match) {
-    return null;
-  }
-
-  const url =
-    `https://thumbnails.roblox.com/v1/assets?assetIds=${match[1]}` +
-    '&returnPolicy=PlaceHolder' +
-    '&size=420x420' +
-    '&format=Png' +
-    '&isCircular=false';
-
-  const response = await fetchBuffer(url);
-
-  if (!response) {
-    return null;
-  }
-
-  try {
-    const json = JSON.parse(
-      response.toString('utf8')
-    );
-
-    const imageUrl =
-      json?.data?.[0]?.imageUrl;
-
-    return imageUrl
-      ? fetchBuffer(imageUrl)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-/* =========================================================
-   CONTRIBUTORS
-   IMPORTANT:
-   PointContributions is the PRIMARY source.
-========================================================= */
-
-function getContributors(league) {
-  const contributions =
-    Array.isArray(
-      league?.PointContributions
-    )
-      ? league.PointContributions
-      : [];
-
-  const owner =
-    league?.Owner &&
-    league.Owner.UserID != null
-      ? league.Owner
-      : null;
-
-  const members =
-    Array.isArray(league?.Members)
-      ? league.Members
-      : [];
-
-  /*
-   * First create a roster map from Owner + Members.
-   * This is only used as a fallback for players
-   * that do not yet have a contribution entry.
-   */
-
-  const roster = new Map();
-
-  if (owner) {
-    roster.set(
-      String(owner.UserID),
-      {
-        userId: owner.UserID,
-        name:
-          owner.DisplayName ||
-          owner.Username ||
-          String(owner.UserID),
-      }
-    );
-  }
-
-  for (const member of members) {
-    if (member?.UserID == null) {
-      continue;
-    }
-
-    const id = String(member.UserID);
-
-    if (!roster.has(id)) {
-      roster.set(id, {
-        userId: member.UserID,
-        name:
-          member.DisplayName ||
-          member.Username ||
-          id,
-      });
-    }
-  }
-
-  /*
-   * PointContributions is the authoritative source
-   * for the actual player contribution values.
-   */
-
-  const contributionMap = new Map();
-
-  for (const entry of contributions) {
-    if (entry?.UserID == null) {
-      continue;
-    }
-
-    const id = String(entry.UserID);
-
-    contributionMap.set(id, {
-      userId: entry.UserID,
-      name:
-        entry.DisplayName ||
-        entry.Username ||
-        roster.get(id)?.name ||
-        id,
-      points: Number(entry.Points || 0),
-      timestamp: Number(
-        entry.Timestamp || 0
-      ),
-    });
-  }
-
-  /*
-   * Start with PointContributions so the displayed
-   * values and names come directly from the API.
-   */
-
-  const contributors = Array.from(
-    contributionMap.values()
-  );
-
-  /*
-   * Add roster members that have no contribution
-   * entry yet. They appear with 0 points.
-   */
-
-  for (const [id, member] of roster) {
-    if (!contributionMap.has(id)) {
-      contributors.push({
-        userId: member.userId,
-        name: member.name,
-        points: 0,
-        timestamp: 0,
-      });
-    }
-  }
-
-  /*
-   * Keep the league roster at its real capacity.
-   * If PointContributions somehow contains an old
-   * player who is no longer a member, roster wins.
-   *
-   * When roster data exists, only current Owner +
-   * Members are displayed.
-   */
-
-  if (roster.size > 0) {
-    return contributors
-      .filter(member =>
-        roster.has(String(member.userId))
-      )
-      .sort(
-        (a, b) =>
-          b.points - a.points
-      );
-  }
-
-  return contributors.sort(
-    (a, b) =>
-      b.points - a.points
-  );
-}
-
-/* =========================================================
-   HISTORY
-========================================================= */
-
-function makeSnapshot(
-  league,
-  contributors
-) {
-  return {
-    timestamp: Date.now(),
-    points: Number(
-      league.Points || 0
-    ),
-
-    members:
-      contributors.map(member => ({
-        userId: member.userId,
-        name: member.name,
-        points: member.points,
-      })),
-  };
-}
-
-function trimHistory(history) {
-  const cutoff =
-    Date.now() -
-    72 * 3600000;
-
-  return history
-    .filter(
-      entry =>
-        Number(entry.timestamp) >=
-        cutoff
-    )
-    .slice(-1000);
-}
-
-function findHistorySnapshot(
-  history,
-  targetMs,
-  toleranceMs
-) {
-  let best = null;
-  let bestDistance = Infinity;
-
-  for (const snapshot of history) {
-    const timestamp =
-      Number(snapshot.timestamp);
-
-    const distance =
-      Math.abs(timestamp - targetMs);
-
-    if (
-      timestamp <=
-        targetMs + toleranceMs &&
-      distance < bestDistance
-    ) {
-      best = snapshot;
-      bestDistance = distance;
-    }
-  }
-
-  return best;
-}
-
-function getMemberDelta(
-  history,
-  userId,
-  hoursAgo
-) {
-  if (!Array.isArray(history)) {
-    return null;
-  }
-
-  const current =
-    history[history.length - 1];
-
-  const currentMember =
-    current?.members?.find(
-      member =>
-        String(member.userId) ===
-        String(userId)
-    );
-
-  if (!currentMember) {
-    return null;
-  }
-
-  const target =
-    Date.now() -
-    hoursAgo * 3600000;
-
-  /*
-   * GitHub Actions runs every 5 minutes.
-   *
-   * 1H:
-   * allow up to 45 minutes difference.
-   *
-   * 24H:
-   * allow up to 3 hours difference.
-   */
-
-  const tolerance =
-    hoursAgo <= 1
-      ? 45 * 60000
-      : 3 * 3600000;
-
-  const oldSnapshot =
-    findHistorySnapshot(
-      history,
-      target,
-      tolerance
-    );
-
-  if (!oldSnapshot) {
-    return null;
-  }
-
-  const oldMember =
-    oldSnapshot.members?.find(
-      member =>
-        String(member.userId) ===
-        String(userId)
-    );
-
-  if (!oldMember) {
-    return null;
-  }
-
-  return (
-    Number(currentMember.points || 0) -
-    Number(oldMember.points || 0)
-  );
-}
-
-/* =========================================================
-   CHART
-========================================================= */
-
-function makeChartSvg(
-  history,
-  contributors
-) {
-  const width = 1320;
-  const height = 410;
-
-  const left = 75;
-  const right = 35;
-  const top = 45;
-  const bottom = 55;
-
-  const chartW =
-    width - left - right;
-
-  const chartH =
-    height - top - bottom;
-
-  const snapshots =
-    history.slice(-25);
-
-  if (!snapshots.length) {
-    return `
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        width="${width}"
-        height="${height}"
-      >
-        <rect
-          width="100%"
-          height="100%"
-          fill="#1d1e22"
-        />
-        <text
-          x="${width / 2}"
-          y="${height / 2}"
-          text-anchor="middle"
-          fill="#9a9ca5"
-          font-size="20"
-          font-family="Arial"
-        >
-          Waiting for history...
-        </text>
-      </svg>
-    `;
-  }
-
-  const maxValue = Math.max(
-    1,
-    ...snapshots.flatMap(
-      snapshot =>
-        (snapshot.members || []).map(
-          member =>
-            Number(member.points || 0)
-        )
-    )
-  );
-
-  const yMax =
-    Math.ceil(
-      maxValue / 500000
-    ) *
-      500000 ||
-    maxValue;
-
-  const colors = [
-    '#12bfff',
-    '#ff3da8',
-    '#ffab1a',
-    '#36e0aa',
-  ];
-
-  const labels =
-    snapshots.map(snapshot => {
-      const hours = Math.round(
-        (Date.now() -
-          Number(snapshot.timestamp)) /
-          3600000
-      );
-
-      return hours <= 0
-        ? 'Now'
-        : `${hours}h`;
-    });
-
-  const x = index =>
-    snapshots.length <= 1
-      ? left + chartW / 2
-      : left +
-        (index /
-          (snapshots.length - 1)) *
-          chartW;
-
-  const y = value =>
-    top +
-    chartH -
-    (Number(value || 0) / yMax) *
-      chartH;
-
-  const grid = [];
-
-  for (let i = 0; i <= 5; i++) {
-    const value =
-      (yMax / 5) * i;
-
-    const yy = y(value);
-
-    grid.push(`
-      <line
-        x1="${left}"
-        y1="${yy}"
-        x2="${left + chartW}"
-        y2="${yy}"
-        stroke="#303238"
-        stroke-width="1"
-      />
-
-      <text
-        x="${left - 12}"
-        y="${yy + 5}"
-        text-anchor="end"
-        fill="#9a9ca5"
-        font-size="15"
-        font-family="Arial"
-      >
-        ${xmlEscape(
-          formatCompact(value)
-        )}
-      </text>
-    `);
-  }
-
-  const series =
-    contributors
-      .map(
-        (member, seriesIndex) => {
-          const color =
-            colors[
-              seriesIndex %
-                colors.length
-            ];
-
-          const values =
-            snapshots.map(
-              snapshot => {
-                const found =
-                  snapshot.members?.find(
-                    m =>
-                      String(
-                        m.userId
-                      ) ===
-                      String(
-                        member.userId
-                      )
-                  );
-
-                return Number(
-                  found?.points || 0
-                );
-              }
-            );
-
-          const linePoints =
-            values
-              .map(
-                (value, index) =>
-                  `${x(index)},${y(value)}`
-              )
-              .join(' ');
-
-          const areaPoints =
-            `${left},${top + chartH} ` +
-            `${linePoints} ` +
-            `${left + chartW},${top + chartH}`;
-
-          const circles =
-            values
-              .map(
-                (value, index) =>
-                  `
-                    <circle
-                      cx="${x(index)}"
-                      cy="${y(value)}"
-                      r="3.5"
-                      fill="${color}"
-                    />
-                  `
-              )
-              .join('');
-
-          return `
-            <polygon
-              points="${areaPoints}"
-              fill="${color}"
-              opacity="0.10"
-            />
-
-            <polyline
-              points="${linePoints}"
-              fill="none"
-              stroke="${color}"
-              stroke-width="3"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-
-            ${circles}
-          `;
-        }
-      )
-      .join('');
-
-  const xLabels =
-    labels
-      .map((label, index) => {
-        if (
-          snapshots.length > 12 &&
-          index % 2 !== 0
-        ) {
-          return '';
-        }
-
-        return `
-          <text
-            x="${x(index)}"
-            y="${height - 18}"
-            text-anchor="middle"
-            fill="#8f919a"
-            font-size="13"
-            font-family="Arial"
-          >
-            ${xmlEscape(label)}
-          </text>
-        `;
-      })
-      .join('');
-
-  return `
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="${width}"
-      height="${height}"
-      viewBox="0 0 ${width} ${height}"
-    >
-      <rect
-        width="100%"
-        height="100%"
-        fill="#1d1e22"
-      />
-
-      ${grid}
-
-      ${series}
-
-      ${xLabels}
-    </svg>
-  `;
-}
-
-/* =========================================================
-   LEAGUE DASHBOARD IMAGE
-========================================================= */
-
-async function makeLeagueCard(
-  league,
-  contributors,
-  history,
-  currentRank
-) {
-  const width = 1400;
-
-  const tableTop = 210;
-  const rowH = 82;
-
-  const chartTop =
-    tableTop +
-    55 +
-    rowH *
-      contributors.length +
-    25;
-
-  const chartHeight = 410;
-
-  const height =
-    chartTop +
-    chartHeight +
-    35;
-
-  const iconBuffer =
-    await resolveLeagueIcon(
-      league.Icon
-    );
-
-  const avatarBuffers =
-    await Promise.all(
-      contributors.map(
-        member =>
-          resolveAvatar(
-            member.userId
-          )
-      )
-    );
-
-  const defs = `
-    <defs>
-      <filter
-        id="shadow"
-        x="-20%"
-        y="-20%"
-        width="140%"
-        height="140%"
-      >
-        <feDropShadow
-          dx="0"
-          dy="6"
-          stdDeviation="12"
-          flood-color="#000000"
-          flood-opacity="0.35"
-        />
-      </filter>
-
-      <clipPath id="iconClip">
-        <rect
-          x="1190"
-          y="35"
-          width="150"
-          height="150"
-          rx="16"
-        />
-      </clipPath>
-    </defs>
-  `;
-
-  const iconImage =
-    iconBuffer
-      ? `
-        <image
-          href="data:image/png;base64,${iconBuffer.toString(
-            'base64'
-          )}"
-          x="1190"
-          y="35"
-          width="150"
-          height="150"
-          preserveAspectRatio="xMidYMid slice"
-          clip-path="url(#iconClip)"
-        />
-      `
-      : `
-        <rect
-          x="1190"
-          y="35"
-          width="150"
-          height="150"
-          rx="16"
-          fill="#303238"
-        />
-      `;
-
-  const title = xmlEscape(
-    `League ${
-      league.Name ||
-      LEAGUE_NAME
-    }`
-  );
-
-  const points =
-    Number(league.Points || 0);
-
-  const snapshotAge =
-    history.length
-      ? formatSnapshotAge(
-          history[
-            history.length - 1
-          ].timestamp
-        )
-      : 'just now';
-
-  const owner =
-    league.Owner?.DisplayName ||
-    'Unknown';
-
-  const level =
-    Number(league.Level || 1);
-
-  const memberCount =
-    contributors.length;
-
-  const capacity =
-    Number(
-      league.MemberCapacity ||
-        memberCount ||
-        4
-    );
-
-  const headers = [
-    ['GLOBAL RANK', 28],
-    ['PLAYER', 190],
-    ['POINTS', 620],
-    ['+1H', 790],
-    ['+24H', 910],
-    ['OFF TIME', 1050],
-    ['SHARE', 1205],
-  ];
-
-  const headerSvg =
-    headers
-      .map(
-        ([text, x]) =>
-          `
-          <text
-            x="${x}"
-            y="${tableTop - 22}"
-            fill="#a8aab2"
-            font-size="16"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ${text}
-          </text>
-        `
-      )
-      .join('');
-
-  const colors = [
-    '#12bfff',
-    '#ff3da8',
-    '#ffab1a',
-    '#36e0aa',
-  ];
-
-  const rows =
-    contributors
-      .map((member, index) => {
-        const y0 =
-          tableTop +
-          index * rowH;
-
-        const color =
-          colors[
-            index % colors.length
-          ];
-
-        const delta1h =
-          getMemberDelta(
-            history,
-            member.userId,
-            1
-          );
-
-        const delta24h =
-          getMemberDelta(
-            history,
-            member.userId,
-            24
-          );
-
-        const share =
-          points > 0
-            ? (member.points /
-                points) *
-              100
-            : 0;
-
-        const avatar =
-          avatarBuffers[index]
-            ? `
-              <image
-                href="data:image/png;base64,${avatarBuffers[
-                  index
-                ].toString('base64')}"
-                x="160"
-                y="${y0 + 10}"
-                width="58"
-                height="58"
-              />
-            `
-            : `
-              <circle
-                cx="189"
-                cy="${y0 + 39}"
-                r="29"
-                fill="#3a3b40"
-              />
-            `;
-
-        return `
-          <rect
-            x="20"
-            y="${y0}"
-            width="1360"
-            height="${rowH - 2}"
-            fill="#20272b"
-            opacity="0.98"
-          />
-
-          <rect
-            x="20"
-            y="${y0}"
-            width="6"
-            height="${rowH - 2}"
-            fill="${color}"
-          />
-
-          <text
-            x="38"
-            y="${y0 + 50}"
-            fill="${color}"
-            font-size="24"
-            font-weight="700"
-            font-family="Arial"
-          >
-            #${index + 1}
-          </text>
-
-          ${avatar}
-
-          <text
-            x="228"
-            y="${y0 + 49}"
-            fill="#f0f1f4"
-            font-size="23"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ${xmlEscape(
-              shorten(
-                member.name,
-                24
-              )
-            )}
-          </text>
-
-          <text
-            x="620"
-            y="${y0 + 49}"
-            fill="${color}"
-            font-size="23"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ★ ${xmlEscape(
-              formatCompact(
-                member.points
-              )
-            )}
-          </text>
-
-          <text
-            x="790"
-            y="${y0 + 49}"
-            fill="#f0f1f4"
-            font-size="22"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ${xmlEscape(
-              formatDelta(
-                delta1h
-              )
-            )}
-          </text>
-
-          <text
-            x="910"
-            y="${y0 + 49}"
-            fill="#f0f1f4"
-            font-size="22"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ${xmlEscape(
-              formatDelta(
-                delta24h
-              )
-            )}
-          </text>
-
-          <text
-            x="1050"
-            y="${y0 + 49}"
-            fill="#f0f1f4"
-            font-size="22"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ${xmlEscape(
-              formatHoursSince(
-                member.timestamp
-              )
-            )}
-          </text>
-
-          <text
-            x="1205"
-            y="${y0 + 49}"
-            fill="${color}"
-            font-size="22"
-            font-weight="700"
-            font-family="Arial"
-          >
-            ${share.toFixed(1)}%
-          </text>
-        `;
-      })
-      .join('');
-
-  const chartSvg =
-    makeChartSvg(
-      history,
-      contributors
-    ).replace(
-      /^<svg[^>]*>|<\/svg>$/g,
-      ''
-    );
-
-  const chartInner =
-    chartSvg.replace(
-      /width="1320" height="410" viewBox="0 0 1320 410"/,
-      `x="40" y="${chartTop}" width="1320" height="410"`
-    );
-
-  const svg = `
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="${width}"
-      height="${height}"
-      viewBox="0 0 ${width} ${height}"
-    >
-      ${defs}
-
-      <rect
-        width="100%"
-        height="100%"
-        rx="22"
-        fill="#191a1e"
-      />
-
-      <rect
-        x="10"
-        y="10"
-        width="1380"
-        height="${height - 20}"
-        rx="22"
-        fill="#242529"
-        filter="url(#shadow)"
-      />
-
-      <text
-        x="55"
-        y="90"
-        fill="#f0f1f4"
-        font-size="38"
-        font-weight="800"
-        font-family="Arial"
-      >
-        ${title}
-      </text>
-
-      <text
-        x="55"
-        y="135"
-        fill="#e8e9ec"
-        font-size="24"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Points: ${xmlEscape(
-          formatCompact(points)
-        )}
-      </text>
-
-      <text
-        x="55"
-        y="172"
-        fill="#e8e9ec"
-        font-size="24"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Global Rank: ${xmlEscape(
-          formatRank(currentRank)
-        )}
-      </text>
-
-      <text
-        x="500"
-        y="135"
-        fill="#e8e9ec"
-        font-size="24"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Level: ${level}
-      </text>
-
-      <text
-        x="500"
-        y="172"
-        fill="#e8e9ec"
-        font-size="24"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Stats snapshot: ${xmlEscape(
-          snapshotAge
-        )}
-      </text>
-
-      <text
-        x="850"
-        y="135"
-        fill="#e8e9ec"
-        font-size="24"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Members: ${memberCount}/${capacity}
-      </text>
-
-      <text
-        x="850"
-        y="172"
-        fill="#e8e9ec"
-        font-size="24"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Owner: ${xmlEscape(owner)}
-      </text>
-
-      ${iconImage}
-
-      <line
-        x1="55"
-        y1="195"
-        x2="1345"
-        y2="195"
-        stroke="#6a6b70"
-        stroke-width="1"
-      />
-
-      ${headerSvg}
-
-      ${rows}
-
-      ${chartInner}
-    </svg>
-  `;
-
-  await sharp(
-    Buffer.from(svg)
-  )
-    .png()
-    .toFile(CARD_FILE);
-
-  return CARD_FILE;
-}
-
-/* =========================================================
-   DISCORD RANK CHANGE MESSAGE
-========================================================= */
-
-function createMovementEmbed(
+function createRankEmbed(
   oldRank,
   newRank,
   points,
   movedLeagues
 ) {
-  const movedUp =
+  const increased =
     newRank < oldRank;
 
-  const difference =
+  const amount =
     Math.abs(
       oldRank - newRank
     );
 
-  const title =
-    movedUp
-      ? `📈 ${LEAGUE_NAME} — Increased!`
-      : `📉 ${LEAGUE_NAME} — Decreased!`;
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        increased
+          ? `📈 ${LEAGUE_NAME} — Increased!`
+          : `📉 ${LEAGUE_NAME} — Decreased!`
+      )
+      .setDescription(
+        increased
+          ? `**${LEAGUE_NAME}** increased **${amount} ${
+              amount === 1
+                ? 'position'
+                : 'positions'
+            }** in the League Leaderboard!`
+          : `**${LEAGUE_NAME}** decreased **${amount} ${
+              amount === 1
+                ? 'position'
+                : 'positions'
+            }** in the League Leaderboard!`
+      )
+      .addFields(
+        {
+          name:
+            '⬅️ Previous place',
+          value:
+            formatRank(
+              oldRank
+            ),
+          inline: true,
+        },
+        {
+          name:
+            '🏆 Current place',
+          value:
+            formatRank(
+              newRank
+            ),
+          inline: true,
+        },
+        {
+          name:
+            '💎 Points',
+          value:
+            formatNumber(
+              points
+            ),
+          inline: true,
+        },
+        {
+          name:
+            increased
+              ? '⬆️ Overtook'
+              : '⬇️ Overtaken by',
+          value:
+            movedLeagues.length
+              ? movedLeagues
+                  .slice(
+                    0,
+                    10
+                  )
+                  .map(
+                    name =>
+                      `• **${name}**`
+                  )
+                  .join('\n')
+              : '• —',
+          inline: false,
+        }
+      )
+      .setFooter({
+        text:
+          'MGKK League • MADE BY BRAT',
+      })
+      .setTimestamp();
 
-  const description =
-    movedUp
-      ? `**${LEAGUE_NAME}** increased **${difference} position${
-          difference === 1
-            ? ''
-            : 's'
-        }** in the League Leaderboard!`
-      : `**${LEAGUE_NAME}** decreased **${difference} position${
-          difference === 1
-            ? ''
-            : 's'
-        }** in the League Leaderboard!`;
-
-  const visible =
-    movedLeagues.slice(0, 15);
-
-  const list =
-    visible.length
-      ? visible
-          .map(
-            name =>
-              `• **${name}**`
-          )
-          .join('\n')
-      : '• Could not determine the leagues for this change.';
-
-  return new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(description)
-    .addFields(
-      {
-        name: '⬅️ Previous place',
-        value: formatRank(oldRank),
-        inline: true,
-      },
-      {
-        name: '🏆 Current place',
-        value: formatRank(newRank),
-        inline: true,
-      },
-      {
-        name: '💎 Points',
-        value: formatNumber(points),
-        inline: true,
-      },
-      {
-        name:
-          movedUp
-            ? '⬆️ Overtook'
-            : '⬇️ Overtaken by',
-        value: list,
-        inline: false,
-      }
-    )
-    .setTimestamp()
-    .setFooter({
-      text:
-        'MGKK League • MADE BY BRAT',
-    });
+  return embed;
 }
 
 async function sendRankChange(
@@ -1582,13 +1802,13 @@ async function sendRankChange(
     !channel.isTextBased()
   ) {
     throw new Error(
-      'Discord channel could not be found or is not text-based.'
+      'Discord channel is invalid'
     );
   }
 
   const payload = {
     embeds: [
-      createMovementEmbed(
+      createRankEmbed(
         oldRank,
         newRank,
         points,
@@ -1597,32 +1817,46 @@ async function sendRankChange(
     ],
   };
 
+  /*
+   * IMPORTANT:
+   * Logo is now a SMALL thumbnail,
+   * not a giant image above the embed.
+   */
   if (
-    fs.existsSync(LOGO_FILE)
+    fs.existsSync(
+      LOGO_FILE
+    )
   ) {
     payload.files = [
       new AttachmentBuilder(
         LOGO_FILE,
         {
-          name: 'logo.png',
+          name:
+            'mgkk-logo.png',
         }
       ),
     ];
+
+    payload.embeds[0].setThumbnail(
+      'attachment://mgkk-logo.png'
+    );
   }
 
-  await channel.send(payload);
+  await channel.send(
+    payload
+  );
 }
 
 /* =========================================================
    DASHBOARD MESSAGE
 ========================================================= */
 
-async function sendLeagueCard(
+async function sendDashboard(
   league,
   contributors,
   history,
-  currentRank,
-  existingMessageId
+  rank,
+  oldMessageId
 ) {
   const channel =
     await client.channels.fetch(
@@ -1634,7 +1868,7 @@ async function sendLeagueCard(
     !channel.isTextBased()
   ) {
     throw new Error(
-      'Discord channel could not be found or is not text-based.'
+      'Discord channel is invalid'
     );
   }
 
@@ -1643,49 +1877,57 @@ async function sendLeagueCard(
       league,
       contributors,
       history,
-      currentRank
+      rank
     );
 
   const file =
     new AttachmentBuilder(
       card,
       {
-        name: 'league-card.png',
+        name:
+          'mgkk-dashboard.png',
       }
     );
 
   /*
-   * Reuse one Discord message.
-   * This prevents the channel from being flooded
-   * every 5 minutes.
+   * Try to update the same message.
    */
-
-  if (existingMessageId) {
+  if (oldMessageId) {
     try {
       const message =
         await channel.messages.fetch(
-          existingMessageId
+          oldMessageId
         );
 
       await message.edit({
         content: '',
         embeds: [],
-        attachments: [],
         files: [file],
       });
+
+      console.log(
+        `[DASHBOARD] Updated ${message.id}`
+      );
 
       return message.id;
     } catch (error) {
       console.warn(
-        `[DASHBOARD] Could not update message ${existingMessageId}: ${error.message}`
+        `[DASHBOARD] Existing message unavailable: ${error.message}`
       );
     }
   }
 
+  /*
+   * No existing message -> create exactly one.
+   */
   const message =
     await channel.send({
       files: [file],
     });
+
+  console.log(
+    `[DASHBOARD] Created ${message.id}`
+  );
 
   return message.id;
 }
@@ -1694,14 +1936,14 @@ async function sendLeagueCard(
    MAIN CHECK
 ========================================================= */
 
-async function checkRank() {
+async function check() {
   console.log(
     `[${new Date().toISOString()}] Checking ${LEAGUE_NAME}...`
   );
 
   const [
     league,
-    { rank, ranking },
+    rankingData,
   ] = await Promise.all([
     getLeague(),
     getLeagueRanking(),
@@ -1712,116 +1954,101 @@ async function checkRank() {
     typeof league !== 'object'
   ) {
     throw new Error(
-      'League data is invalid.'
+      'Invalid league data'
     );
   }
 
   const points =
-    Number(league.Points || 0);
+    Number(
+      league.Points || 0
+    );
 
-  if (
-    !Number.isFinite(points) ||
-    points <= 0
-  ) {
+  if (!Number.isFinite(points)) {
     throw new Error(
-      `Could not read ${LEAGUE_NAME} points.`
+      'Invalid league points'
     );
   }
-
-  /*
-   * IMPORTANT:
-   * This now reads PointContributions first.
-   */
 
   const contributors =
-    getContributors(league);
-
-  if (!contributors.length) {
-    throw new Error(
-      `No contributors found for ${LEAGUE_NAME}.`
+    await getContributors(
+      league
     );
-  }
 
-  const state = loadState();
+  const state =
+    loadState();
 
-  const now =
-    new Date().toISOString();
-
-  /*
-   * Add a fresh snapshot every successful run.
-   */
+  const snapshot =
+    createSnapshot(
+      league,
+      contributors
+    );
 
   const history =
     trimHistory([
       ...state.history,
-      makeSnapshot(
-        league,
-        contributors
-      ),
+      snapshot,
     ]);
 
+  const rank =
+    rankingData.rank;
+
   console.log(
-    `${LEAGUE_NAME}: rank ${formatRank(rank)} | ${formatNumber(points)} points`
+    `${LEAGUE_NAME} ${formatRank(
+      rank
+    )} | ${formatNumber(
+      points
+    )} points`
   );
 
   console.log(
-    `Contributors: ${contributors
+    contributors
       .map(
         member =>
-          `${member.name}=${formatCompact(
+          `${member.name}: ${formatCompact(
             member.points
           )}`
       )
-      .join(', ')}`
+      .join(' | ')
   );
 
+  /*
+   * Rank notification.
+   */
   const firstRun =
     state.rank === null ||
     !Number.isFinite(
       Number(state.rank)
-    ) ||
-    !Array.isArray(
-      state.ranking
     );
-
-  /*
-   * Send rank movement only after the
-   * first successful check.
-   */
 
   if (
     !firstRun &&
     Number(state.rank) !== rank
   ) {
-    const movedLeagues =
+    const moved =
       getPassedLeagues(
         Number(state.rank),
         rank,
         state.ranking,
-        ranking
+        rankingData.ranking
       );
 
     await sendRankChange(
       Number(state.rank),
       rank,
       points,
-      movedLeagues
+      moved
     );
 
     console.log(
-      `Rank changed: ${formatRank(
-        state.rank
-      )} -> ${formatRank(rank)}`
+      `[RANK] ${state.rank} -> ${rank}`
     );
   }
 
   /*
-   * Keep one dashboard message and update
-   * that same message every successful run.
+   * Dashboard.
    */
-
   const dashboardMessageId =
-    await sendLeagueCard(
+    await sendDashboard(
       league,
       contributors,
       history,
@@ -1832,58 +2059,44 @@ async function checkRank() {
   saveState({
     rank,
     points,
-    lastCheck: now,
-    ranking,
+    ranking:
+      rankingData.ranking,
     history,
     dashboardMessageId,
+    lastCheck:
+      new Date().toISOString(),
   });
 
   console.log(
-    `[SUCCESS] ${LEAGUE_NAME} dashboard updated.`
+    '[DONE] Check completed successfully.'
   );
 }
 
 /* =========================================================
-   STARTUP
+   DISCORD
 ========================================================= */
 
 client.once(
   'ready',
   async () => {
     console.log(
-      '===================================='
+      '================================'
     );
 
     console.log(
-      'MGKK Discord Bot'
+      `Logged in as ${client.user.tag}`
     );
 
     console.log(
-      '===================================='
+      `League: ${LEAGUE_NAME}`
     );
 
     console.log(
-      `Logged in as: ${client.user.tag}`
-    );
-
-    console.log(
-      `Watching league: ${LEAGUE_NAME}`
-    );
-
-    console.log(
-      `Channel: ${CHANNEL_ID}`
-    );
-
-    console.log(
-      'Mode: GitHub Actions one-shot check'
-    );
-
-    console.log(
-      '===================================='
+      '================================'
     );
 
     try {
-      await checkRank();
+      await check();
     } catch (error) {
       console.error(
         `[CHECK ERROR] ${
@@ -1933,12 +2146,12 @@ process.on(
   }
 );
 
-client.login(TOKEN).catch(
-  error => {
-    console.error(
-      `[LOGIN ERROR] ${error.message}`
-    );
+client.login(
+  TOKEN
+).catch(error => {
+  console.error(
+    `[LOGIN ERROR] ${error.message}`
+  );
 
-    process.exit(1);
-  }
-);
+  process.exit(1);
+});
