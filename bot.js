@@ -1,674 +1,541 @@
-require('dotenv').config();
-
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const sharp = require("sharp");
 const {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  AttachmentBuilder,
-} = require('discord.js');
+} = require("discord.js");
 
-const fs = require('fs');
-const path = require('path');
-const sharp = require('sharp');
+require("dotenv").config();
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const LEAGUE_NAME = process.env.LEAGUE_NAME || 'MGKK';
+const API_BASE = "https://ps99.biggamesapi.io/v1";
+const LEAGUE_NAME = process.env.LEAGUE_NAME || "MGKK";
 
-const API_BASE = 'https://ps99.biggamesapi.io/v1';
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
-const STATE_FILE = path.join(__dirname, 'state.json');
-const LOGO_FILE = path.join(__dirname, 'logo.png');
-const CARD_FILE = path.join(__dirname, 'league-card.png');
+const STATE_FILE = path.join(process.cwd(), "state.json");
 
-if (!TOKEN) {
-  console.error('Missing DISCORD_TOKEN');
-  process.exit(1);
+const SNAPSHOT_INTERVAL = 5 * 60 * 1000;
+const HISTORY_RETENTION = 7 * 24 * 60 * 60 * 1000;
+
+if (!DISCORD_TOKEN) {
+  throw new Error("DISCORD_TOKEN is missing.");
 }
 
-if (!CHANNEL_ID) {
-  console.error('Missing DISCORD_CHANNEL_ID');
-  process.exit(1);
+if (!DISCORD_CHANNEL_ID) {
+  throw new Error("DISCORD_CHANNEL_ID is missing.");
 }
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
 
 /* =========================================================
-   STATE
+   HELPERS
 ========================================================= */
 
-function defaultState() {
-  return {
-    rank: null,
-    points: null,
-    ranking: [],
-    history: [],
-    dashboardMessageId: null,
-    lastCheck: null,
-  };
-}
-
 function loadState() {
-  try {
-    if (!fs.existsSync(STATE_FILE)) {
-      return defaultState();
-    }
+  if (!fs.existsSync(STATE_FILE)) {
+    return {
+      leagueName: LEAGUE_NAME,
+      snapshots: [],
+      previousRank: null,
+      dashboardMessageId: null,
+    };
+  }
 
-    const parsed = JSON.parse(
-      fs.readFileSync(STATE_FILE, 'utf8')
-    );
+  try {
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
     return {
-      ...defaultState(),
-      ...parsed,
-      ranking: Array.isArray(parsed.ranking)
-        ? parsed.ranking
+      leagueName: LEAGUE_NAME,
+      snapshots: Array.isArray(state.snapshots)
+        ? state.snapshots
         : [],
-      history: Array.isArray(parsed.history)
-        ? parsed.history
-        : [],
+      previousRank:
+        Number.isFinite(state.previousRank)
+          ? state.previousRank
+          : null,
+      dashboardMessageId:
+        typeof state.dashboardMessageId === "string"
+          ? state.dashboardMessageId
+          : null,
     };
-  } catch (error) {
-    console.error(
-      `[STATE] ${error.message}`
-    );
+  } catch {
+    console.warn("state.json is invalid. Starting fresh.");
 
-    return defaultState();
+    return {
+      leagueName: LEAGUE_NAME,
+      snapshots: [],
+      previousRank: null,
+      dashboardMessageId: null,
+    };
   }
 }
 
 function saveState(state) {
-  const temp = `${STATE_FILE}.tmp`;
-
   fs.writeFileSync(
-    temp,
-    JSON.stringify(state, null, 2) + '\n',
-    'utf8'
+    STATE_FILE,
+    JSON.stringify(state, null, 2),
+    "utf8"
   );
-
-  fs.renameSync(temp, STATE_FILE);
 }
 
-/* =========================================================
-   BIG GAMES API
-========================================================= */
-
-async function api(endpoint) {
-  const response = await fetch(
-    `${API_BASE}${endpoint}`,
-    {
-      headers: {
-        accept: 'application/json',
-        'user-agent: 'MGKK-Discord-Bot/7.0',
-      },
-      signal: AbortSignal.timeout(15000),
-    }
-  );
-
-  const text = await response.text();
-
-  let json;
-
-  try {
-    json = text
-      ? JSON.parse(text)
-      : null;
-  } catch {
-    throw new Error(
-      `Invalid API response: ${response.status}`
-    );
+function formatPoints(value) {
+  if (!Number.isFinite(value)) {
+    return "0";
   }
 
-  if (!response.ok) {
-    throw new Error(
-      json?.error?.message ||
-        json?.message ||
-        `API error ${response.status}`
-    );
+  const abs = Math.abs(value);
+
+  if (abs >= 1_000_000_000) {
+    return `${(value / 1_000_000_000).toFixed(2)}b`;
   }
 
-  if (json?.status === 'error') {
-    throw new Error(
-      json?.error?.message ||
-        'BIG Games API error'
-    );
+  if (abs >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(2)}m`;
   }
 
-  return json;
+  if (abs >= 1_000) {
+    return `${(value / 1_000).toFixed(2)}k`;
+  }
+
+  return Math.round(value).toLocaleString("en-US");
 }
 
-async function getLeague() {
-  const result = await api(
-    `/leagues/${encodeURIComponent(
-      LEAGUE_NAME
-    )}`
-  );
-
-  return result?.data ?? result;
-}
-
-async function getLeagueRanking() {
-  const pageSize = 100;
-  const ranking = [];
-
-  for (let page = 1; page <= 10000; page++) {
-    const result = await api(
-      `/leagues/?page=${page}&pageSize=${pageSize}&sort=Points&sortOrder=desc`
-    );
-
-    const leagues = result?.data?.leagues;
-
-    if (!Array.isArray(leagues)) {
-      throw new Error(
-        'Invalid league ranking response'
-      );
-    }
-
-    if (leagues.length === 0) {
-      break;
-    }
-
-    for (const league of leagues) {
-      const name = String(
-        league?.Name || ''
-      ).trim();
-
-      if (name) {
-        ranking.push(name);
-      }
-    }
-
-    if (leagues.length < pageSize) {
-      break;
-    }
-  }
-
-  const index = ranking.findIndex(
-    name =>
-      name.toLowerCase() ===
-      LEAGUE_NAME.toLowerCase()
-  );
-
-  if (index === -1) {
-    throw new Error(
-      `${LEAGUE_NAME} was not found in leaderboard`
-    );
-  }
-
-  return {
-    rank: index + 1,
-    ranking,
-  };
-}
-
-/* =========================================================
-   ROBLOX USER LOOKUP
-========================================================= */
-
-async function getRobloxUsers(userIds) {
-  const uniqueIds = [
-    ...new Set(
-      userIds
-        .map(id => Number(id))
-        .filter(
-          id =>
-            Number.isInteger(id) &&
-            id > 0
-        )
-    ),
-  ];
-
-  const users = new Map();
-
-  for (
-    let i = 0;
-    i < uniqueIds.length;
-    i += 50
-  ) {
-    const batch = uniqueIds.slice(
-      i,
-      i + 50
-    );
-
-    try {
-      const response = await fetch(
-        'https://users.roblox.com/v1/users',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type':
-              'application/json',
-            accept:
-              'application/json',
-          },
-          body: JSON.stringify({
-            userIds: batch,
-            excludeBannedUsers: false,
-          }),
-          signal:
-            AbortSignal.timeout(10000),
-        }
-      );
-
-      if (!response.ok) {
-        console.warn(
-          `[ROBLOX] User lookup failed: ${response.status}`
-        );
-        continue;
-      }
-
-      const json =
-        await response.json();
-
-      for (const user of json?.data || []) {
-        users.set(
-          String(user.id),
-          {
-            username:
-              user.name ||
-              String(user.id),
-
-            displayName:
-              user.displayName ||
-              user.name ||
-              String(user.id),
-          }
-        );
-      }
-    } catch (error) {
-      console.warn(
-        `[ROBLOX] ${error.message}`
-      );
-    }
-  }
-
-  return users;
-}
-
-/* =========================================================
-   CONTRIBUTORS
-========================================================= */
-
-async function getContributors(
-  league
-) {
-  const pointContributions =
-    Array.isArray(
-      league?.PointContributions
-    )
-      ? league.PointContributions
-      : [];
-
-  const owner =
-    league?.Owner &&
-    league.Owner.UserID != null
-      ? league.Owner
-      : null;
-
-  const members =
-    Array.isArray(league?.Members)
-      ? league.Members
-      : [];
-
-  /*
-   * Roster = Owner + Members
-   */
-  const roster = new Map();
-
-  if (owner) {
-    roster.set(
-      String(owner.UserID),
-      {
-        userId: owner.UserID,
-        name:
-          owner.DisplayName ||
-          owner.Username ||
-          null,
-      }
-    );
-  }
-
-  for (const member of members) {
-    if (member?.UserID == null) {
-      continue;
-    }
-
-    roster.set(
-      String(member.UserID),
-      {
-        userId: member.UserID,
-        name:
-          member.DisplayName ||
-          member.Username ||
-          null,
-      }
-    );
-  }
-
-  /*
-   * PointContributions = authoritative points.
-   */
-  const contributionMap = new Map();
-
-  for (const contribution of pointContributions) {
-    if (contribution?.UserID == null) {
-      continue;
-    }
-
-    contributionMap.set(
-      String(contribution.UserID),
-      {
-        userId:
-          contribution.UserID,
-
-        points:
-          Number(
-            contribution.Points || 0
-          ),
-
-        timestamp:
-          Number(
-            contribution.Timestamp || 0
-          ),
-
-        name:
-          contribution.DisplayName ||
-          contribution.Username ||
-          null,
-      }
-    );
-  }
-
-  /*
-   * Make sure all roster members exist,
-   * even if they have 0 contribution.
-   */
-  const contributors = [];
-
-  for (const [id, member] of roster) {
-    const contribution =
-      contributionMap.get(id);
-
-    contributors.push({
-      userId:
-        member.userId,
-
-      name:
-        contribution?.name ||
-        member.name ||
-        null,
-
-      points:
-        Number(
-          contribution?.points || 0
-        ),
-
-      timestamp:
-        Number(
-          contribution?.timestamp || 0
-        ),
-    });
-  }
-
-  /*
-   * Resolve missing numeric names through Roblox.
-   */
-  const missingIds =
-    contributors
-      .filter(
-        member =>
-          !member.name ||
-          /^\d+$/.test(
-            String(member.name)
-          )
-      )
-      .map(
-        member => member.userId
-      );
-
-  const robloxUsers =
-    await getRobloxUsers(
-      missingIds
-    );
-
-  for (const member of contributors) {
-    const user =
-      robloxUsers.get(
-        String(member.userId)
-      );
-
-    if (user) {
-      member.name =
-        user.displayName ||
-        user.username;
-    }
-
-    if (!member.name) {
-      member.name =
-        `User ${member.userId}`;
-    }
-  }
-
-  contributors.sort(
-    (a, b) =>
-      b.points - a.points
-  );
-
-  return contributors;
-}
-
-/* =========================================================
-   FORMATTERS
-========================================================= */
-
-function formatNumber(value) {
-  return Number(
-    value || 0
-  ).toLocaleString('en-US');
-}
-
-function formatCompact(value) {
-  const n = Number(value || 0);
-
-  if (!Number.isFinite(n)) {
-    return '0';
-  }
-
-  if (Math.abs(n) >= 1e9) {
-    return `${(
-      n / 1e9
-    ).toFixed(2)}b`;
-  }
-
-  if (Math.abs(n) >= 1e6) {
-    return `${(
-      n / 1e6
-    ).toFixed(2)}m`;
-  }
-
-  if (Math.abs(n) >= 1e3) {
-    return `${(
-      n / 1e3
-    ).toFixed(2)}k`;
-  }
-
-  return `${Math.round(n)}`;
-}
-
-function formatRank(rank) {
-  return `#${formatNumber(rank)}`;
+function formatFullPoints(value) {
+  return Math.round(value || 0).toLocaleString("en-US");
 }
 
 function formatDelta(value) {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return '—';
+  if (value === null || value === undefined) {
+    return "—";
   }
 
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return '—';
+  if (!Number.isFinite(value)) {
+    return "—";
   }
 
-  if (n === 0) {
-    return '0';
+  if (value === 0) {
+    return "0";
   }
 
-  return `${
-    n > 0 ? '+' : ''
-  }${formatCompact(n)}`;
+  return `${value > 0 ? "+" : ""}${formatPoints(value)}`;
 }
 
-function xmlEscape(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(
-      /</g,
-      '&lt;'
-    )
-    .replace(
-      />/g,
-      '&gt;'
-    )
-    .replace(
-      /"/g,
-      '&quot;'
-    )
-    .replace(
-      /'/g,
-      '&apos;'
+function escapeXml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+/* =========================================================
+   HTTP
+========================================================= */
+
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(
+      url,
+      {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "MGKK-Discord-Bot/2.0",
+        },
+      },
+      (response) => {
+        let body = "";
+
+        response.setEncoding("utf8");
+
+        response.on("data", (chunk) => {
+          body += chunk;
+        });
+
+        response.on("end", () => {
+          let parsed;
+
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            reject(
+              new Error(
+                `Invalid JSON from API (${response.statusCode}).`
+              )
+            );
+            return;
+          }
+
+          if (
+            response.statusCode < 200 ||
+            response.statusCode >= 300
+          ) {
+            const message =
+              parsed?.error?.message ||
+              `HTTP ${response.statusCode}`;
+
+            reject(new Error(message));
+            return;
+          }
+
+          if (parsed?.status === "error") {
+            reject(
+              new Error(
+                parsed?.error?.message ||
+                  "API returned an error."
+              )
+            );
+            return;
+          }
+
+          resolve(parsed);
+        });
+      }
     );
+
+    request.setTimeout(20_000, () => {
+      request.destroy(
+        new Error("API request timed out.")
+      );
+    });
+
+    request.on("error", reject);
+  });
 }
 
-function shorten(value, max) {
-  const text =
-    String(value ?? '');
+async function getLeague() {
+  const url =
+    `${API_BASE}/leagues/` +
+    encodeURIComponent(LEAGUE_NAME);
 
-  if (text.length <= max) {
-    return text;
+  const response = await getJson(url);
+
+  if (!response?.data) {
+    throw new Error("League API returned no data.");
   }
 
-  return `${text.slice(
-    0,
-    max - 1
-  )}…`;
+  return response.data;
+}
+
+/* =========================================================
+   LEAGUE RANK
+========================================================= */
+
+/*
+  The league detail endpoint gives us the league itself,
+  but not its global rank.
+
+  We therefore inspect leaderboard pages around the previous
+  rank and expand outward when necessary.
+
+  Page size = 100, which is the API maximum.
+*/
+
+async function getLeagueRank(points, previousRank) {
+  const PAGE_SIZE = 100;
+
+  let center;
+
+  if (
+    Number.isFinite(previousRank) &&
+    previousRank > 0
+  ) {
+    center = Math.max(
+      1,
+      Math.floor((previousRank - 1) / PAGE_SIZE) + 1
+    );
+  } else {
+    center = 1;
+  }
+
+  const checkedPages = new Set();
+
+  async function checkPage(page) {
+    if (checkedPages.has(page)) {
+      return null;
+    }
+
+    checkedPages.add(page);
+
+    const url =
+      `${API_BASE}/leagues` +
+      `?page=${page}` +
+      `&pageSize=${PAGE_SIZE}` +
+      `&sort=Points` +
+      `&sortOrder=desc`;
+
+    const response = await getJson(url);
+
+    const leagues =
+      response?.data?.leagues || [];
+
+    for (let index = 0; index < leagues.length; index++) {
+      const league = leagues[index];
+
+      if (
+        String(league.Name).toLowerCase() ===
+        LEAGUE_NAME.toLowerCase()
+      ) {
+        return (
+          (page - 1) * PAGE_SIZE +
+          index +
+          1
+        );
+      }
+    }
+
+    return null;
+  }
+
+  /*
+    First try the previous position.
+  */
+  let rank = await checkPage(center);
+
+  if (rank) {
+    return rank;
+  }
+
+  /*
+    Search nearby pages.
+  */
+  for (let distance = 1; distance <= 10; distance++) {
+    const pages = [
+      center - distance,
+      center + distance,
+    ].filter((page) => page >= 1);
+
+    for (const page of pages) {
+      rank = await checkPage(page);
+
+      if (rank) {
+        return rank;
+      }
+    }
+  }
+
+  /*
+    If this is the first run, scan the first 20 pages.
+    This covers the top 2000 leagues.
+  */
+  if (!Number.isFinite(previousRank)) {
+    for (let page = 1; page <= 20; page++) {
+      rank = await checkPage(page);
+
+      if (rank) {
+        return rank;
+      }
+    }
+  }
+
+  /*
+    If the league wasn't found near the previous rank,
+    expand progressively.
+
+    This avoids downloading the entire leaderboard on every
+    5-minute run.
+  */
+  const expansion = [
+    25,
+    50,
+    75,
+    100,
+    150,
+    200,
+    300,
+    400,
+    500,
+    700,
+    900,
+  ];
+
+  for (const page of expansion) {
+    rank = await checkPage(page);
+
+    if (rank) {
+      return rank;
+    }
+  }
+
+  /*
+    We do not invent a rank.
+  */
+  console.warn(
+    `Could not find ${LEAGUE_NAME} in inspected leaderboard pages.`
+  );
+
+  return null;
+}
+
+/* =========================================================
+   MEMBERS / CONTRIBUTIONS
+========================================================= */
+
+function buildRoster(league) {
+  const roster = [];
+
+  if (league.Owner?.UserID != null) {
+    roster.push({
+      userId: String(league.Owner.UserID),
+      displayName:
+        league.Owner.DisplayName ||
+        String(league.Owner.UserID),
+    });
+  }
+
+  if (Array.isArray(league.Members)) {
+    for (const member of league.Members) {
+      if (member?.UserID == null) {
+        continue;
+      }
+
+      const userId = String(member.UserID);
+
+      if (
+        roster.some(
+          (player) => player.userId === userId
+        )
+      ) {
+        continue;
+      }
+
+      roster.push({
+        userId,
+        displayName:
+          member.DisplayName || userId,
+      });
+    }
+  }
+
+  return roster.slice(0, 4);
+}
+
+function buildContributionMap(league) {
+  const map = new Map();
+
+  if (!Array.isArray(league.PointContributions)) {
+    return map;
+  }
+
+  for (const entry of league.PointContributions) {
+    if (entry?.UserID == null) {
+      continue;
+    }
+
+    map.set(String(entry.UserID), {
+      userId: String(entry.UserID),
+      displayName:
+        entry.DisplayName ||
+        String(entry.UserID),
+      points: Number(entry.Points) || 0,
+      timestamp:
+        Number.isFinite(Number(entry.Timestamp))
+          ? Number(entry.Timestamp)
+          : null,
+    });
+  }
+
+  return map;
+}
+
+function buildPlayers(league) {
+  const roster = buildRoster(league);
+  const contributionMap =
+    buildContributionMap(league);
+
+  return roster.map((member) => {
+    const contribution =
+      contributionMap.get(member.userId);
+
+    return {
+      userId: member.userId,
+      displayName:
+        contribution?.displayName ||
+        member.displayName ||
+        member.userId,
+      points:
+        contribution?.points || 0,
+      timestamp:
+        contribution?.timestamp || null,
+    };
+  });
 }
 
 /* =========================================================
    HISTORY
 ========================================================= */
 
-function createSnapshot(
-  league,
-  contributors
-) {
-  return {
-    timestamp:
-      Date.now(),
+function addSnapshot(state, players, timestamp) {
+  const playerPoints = {};
 
-    points:
-      Number(
-        league.Points || 0
-      ),
-
-    members:
-      contributors.map(
-        member => ({
-          userId:
-            member.userId,
-
-          name:
-            member.name,
-
-          points:
-            member.points,
-        })
-      ),
-  };
-}
-
-function trimHistory(history) {
-  const cutoff =
-    Date.now() -
-    72 * 60 * 60 * 1000;
-
-  return history
-    .filter(
-      item =>
-        Number(
-          item.timestamp
-        ) >= cutoff
-    )
-    .slice(-1000);
-}
-
-function getMemberDelta(
-  history,
-  userId,
-  hoursAgo
-) {
-  if (!history.length) {
-    return null;
+  for (const player of players) {
+    playerPoints[player.userId] =
+      Number(player.points) || 0;
   }
 
-  const current =
-    history[
-      history.length - 1
-    ];
+  state.snapshots.push({
+    timestamp,
+    players: playerPoints,
+  });
 
-  const currentMember =
-    current.members?.find(
-      member =>
-        String(
-          member.userId
-        ) ===
-        String(userId)
+  const cutoff =
+    timestamp - HISTORY_RETENTION;
+
+  state.snapshots =
+    state.snapshots.filter(
+      (snapshot) =>
+        Number(snapshot.timestamp) >= cutoff
     );
 
-  if (!currentMember) {
-    return null;
+  /*
+    Remove snapshots that are almost identical in time.
+    This prevents duplicate runs from bloating state.json.
+  */
+  const cleaned = [];
+
+  for (const snapshot of state.snapshots) {
+    const last =
+      cleaned[cleaned.length - 1];
+
+    if (
+      !last ||
+      Math.abs(
+        snapshot.timestamp -
+          last.timestamp
+      ) >= 60
+    ) {
+      cleaned.push(snapshot);
+    }
   }
 
-  const target =
-    Date.now() -
-    hoursAgo *
-      60 *
-      60 *
-      1000;
+  state.snapshots = cleaned;
+}
 
+function getPointsAtOrBefore(
+  state,
+  userId,
+  targetTimestamp
+) {
   let best = null;
-  let bestDistance =
-    Infinity;
 
-  for (const snapshot of history) {
-    const timestamp =
-      Number(
-        snapshot.timestamp
-      );
-
+  for (const snapshot of state.snapshots) {
     if (
-      timestamp > target
+      Number(snapshot.timestamp) <=
+      targetTimestamp
     ) {
-      continue;
-    }
-
-    const distance =
-      Math.abs(
-        timestamp - target
-      );
-
-    if (
-      distance <
-      bestDistance
-    ) {
-      best = snapshot;
-      bestDistance =
-        distance;
+      if (
+        !best ||
+        Number(snapshot.timestamp) >
+          Number(best.timestamp)
+      ) {
+        best = snapshot;
+      }
     }
   }
 
@@ -676,1482 +543,1413 @@ function getMemberDelta(
     return null;
   }
 
-  const oldMember =
-    best.members?.find(
-      member =>
-        String(
-          member.userId
-        ) ===
-        String(userId)
-    );
+  const points =
+    best.players?.[userId];
 
-  if (!oldMember) {
+  if (!Number.isFinite(Number(points))) {
     return null;
   }
 
-  return (
-    Number(
-      currentMember.points || 0
-    ) -
-    Number(
-      oldMember.points || 0
-    )
-  );
+  return Number(points);
+}
+
+function getDelta(
+  state,
+  userId,
+  currentPoints,
+  millisecondsAgo
+) {
+  const now = Date.now();
+  const target =
+    now - millisecondsAgo;
+
+  const oldPoints =
+    getPointsAtOrBefore(
+      state,
+      userId,
+      target
+    );
+
+  if (oldPoints === null) {
+    return null;
+  }
+
+  return currentPoints - oldPoints;
 }
 
 /* =========================================================
-   ROBLOX AVATAR
+   ROBLOX AVATARS
 ========================================================= */
 
-async function getAvatar(
-  userId
-) {
-  try {
-    /*
-     * IMPORTANT:
-     * thumbnails endpoint returns JSON.
-     * We first read imageUrl, then download
-     * the actual PNG.
-     */
-    const response = await fetch(
-      'https://thumbnails.roblox.com/v1/users/avatar-headshot' +
-        `?userIds=${encodeURIComponent(
-          userId
-        )}` +
-        '&size=150x150' +
-        '&format=Png' +
-        '&isCircular=true',
+function getAvatarUrl(userIds) {
+  if (!userIds.length) {
+    return new Map();
+  }
+
+  return getJson(
+    "https://thumbnails.roblox.com/v1/users/avatar-headshot" +
+      `?userIds=${userIds.join(",")}` +
+      "&size=150x150" +
+      "&format=Png" +
+      "&isCircular=true"
+  )
+    .then((response) => {
+      const map = new Map();
+
+      for (const item of response?.data || []) {
+        if (
+          item?.targetId != null &&
+          item?.imageUrl
+        ) {
+          map.set(
+            String(item.targetId),
+            item.imageUrl
+          );
+        }
+      }
+
+      return map;
+    })
+    .catch((error) => {
+      console.warn(
+        "Could not load Roblox avatars:",
+        error.message
+      );
+
+      return new Map();
+    });
+}
+
+function downloadBuffer(url) {
+  return new Promise((resolve, reject) => {
+    https.get(
+      url,
       {
         headers: {
-          accept:
-            'application/json',
+          "User-Agent": "MGKK-Discord-Bot/2.0",
         },
-        signal:
-          AbortSignal.timeout(10000),
+      },
+      (response) => {
+        if (
+          response.statusCode >= 300 &&
+          response.statusCode < 400 &&
+          response.headers.location
+        ) {
+          downloadBuffer(
+            response.headers.location
+          )
+            .then(resolve)
+            .catch(reject);
+
+          return;
+        }
+
+        if (response.statusCode !== 200) {
+          reject(
+            new Error(
+              `Avatar HTTP ${response.statusCode}`
+            )
+          );
+          return;
+        }
+
+        const chunks = [];
+
+        response.on("data", (chunk) => {
+          chunks.push(chunk);
+        });
+
+        response.on("end", () => {
+          resolve(
+            Buffer.concat(chunks)
+          );
+        });
+      }
+    ).on("error", reject);
+  });
+}
+
+/* =========================================================
+   SVG DASHBOARD
+========================================================= */
+
+const PLAYER_COLORS = [
+  "#19c7ff",
+  "#ff3ca6",
+  "#ffab19",
+  "#35e0b2",
+];
+
+function makeText(
+  x,
+  y,
+  text,
+  options = {}
+) {
+  const {
+    size = 24,
+    weight = 400,
+    fill = "#ffffff",
+    anchor = "start",
+    opacity = 1,
+    family = "Arial, Helvetica, sans-serif",
+  } = options;
+
+  return `
+    <text
+      x="${x}"
+      y="${y}"
+      font-family="${family}"
+      font-size="${size}px"
+      font-weight="${weight}"
+      fill="${fill}"
+      text-anchor="${anchor}"
+      opacity="${opacity}"
+    >${escapeXml(text)}</text>
+  `;
+}
+
+function makeRoundedRect(
+  x,
+  y,
+  width,
+  height,
+  radius,
+  fill,
+  stroke = "none",
+  strokeWidth = 0
+) {
+  return `
+    <rect
+      x="${x}"
+      y="${y}"
+      width="${width}"
+      height="${height}"
+      rx="${radius}"
+      fill="${fill}"
+      stroke="${stroke}"
+      stroke-width="${strokeWidth}"
+    />
+  `;
+}
+
+function makeDashboardSvg({
+  league,
+  rank,
+  players,
+  state,
+  avatarBuffers,
+}) {
+  const width = 1600;
+  const height = 1080;
+
+  const bg = "#17191d";
+  const panel = "#20242a";
+  const panel2 = "#252a31";
+  const border = "#30363e";
+  const muted = "#8f98a5";
+  const white = "#f4f6f8";
+
+  let svg = `
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="${width}"
+    height="${height}"
+    viewBox="0 0 ${width} ${height}"
+  >
+
+    <defs>
+
+      <linearGradient
+        id="headerGradient"
+        x1="0"
+        y1="0"
+        x2="1"
+        y2="1"
+      >
+        <stop offset="0%" stop-color="#202a35"/>
+        <stop offset="100%" stop-color="#171a1f"/>
+      </linearGradient>
+
+      <filter
+        id="shadow"
+        x="-20%"
+        y="-20%"
+        width="140%"
+        height="140%"
+      >
+        <feDropShadow
+          dx="0"
+          dy="8"
+          stdDeviation="12"
+          flood-color="#000000"
+          flood-opacity="0.30"
+        />
+      </filter>
+
+    </defs>
+
+    ${makeRoundedRect(
+      0,
+      0,
+      width,
+      height,
+      34,
+      bg
+    )}
+
+    ${makeRoundedRect(
+      36,
+      30,
+      width - 72,
+      145,
+      24,
+      "url(#headerGradient)",
+      border,
+      2
+    )}
+
+    ${makeText(
+      75,
+      82,
+      `⭐ ${league.Name || LEAGUE_NAME}`,
+      {
+        size: 42,
+        weight: 800,
+        fill: white,
+      }
+    )}
+
+    ${makeText(
+      75,
+      125,
+      "League dashboard",
+      {
+        size: 22,
+        weight: 500,
+        fill: muted,
+      }
+    )}
+
+    ${makeText(
+      width - 75,
+      80,
+      rank ? `#${rank}` : "#—",
+      {
+        size: 42,
+        weight: 800,
+        fill: "#ffd35a",
+        anchor: "end",
+      }
+    )}
+
+    ${makeText(
+      width - 75,
+      122,
+      "GLOBAL RANK",
+      {
+        size: 18,
+        weight: 700,
+        fill: muted,
+        anchor: "end",
+      }
+    )}
+
+    ${makeRoundedRect(
+      36,
+      200,
+      width - 72,
+      135,
+      24,
+      panel,
+      border,
+      2
+    )}
+
+    ${makeText(
+      75,
+      250,
+      "TOTAL LEAGUE POINTS",
+      {
+        size: 18,
+        weight: 700,
+        fill: muted,
+      }
+    )}
+
+    ${makeText(
+      75,
+      305,
+      formatFullPoints(
+        Number(league.Points) || 0
+      ),
+      {
+        size: 46,
+        weight: 800,
+        fill: white,
+      }
+    )}
+
+    ${makeText(
+      width - 75,
+      255,
+      `${players.length}/4 MEMBERS`,
+      {
+        size: 20,
+        weight: 700,
+        fill: "#55d7ff",
+        anchor: "end",
+      }
+    )}
+
+    ${makeText(
+      width - 75,
+      302,
+      "Live API data",
+      {
+        size: 18,
+        weight: 500,
+        fill: muted,
+        anchor: "end",
+      }
+    )}
+
+    ${makeText(
+      55,
+      395,
+      "PLAYER CONTRIBUTIONS",
+      {
+        size: 20,
+        weight: 800,
+        fill: white,
+      }
+    )}
+
+    ${makeRoundedRect(
+      36,
+      420,
+      width - 72,
+      300,
+      24,
+      panel,
+      border,
+      2
+    )}
+  `;
+
+  /*
+    Table header
+  */
+
+  svg += makeText(
+    170,
+    460,
+    "PLAYER",
+    {
+      size: 16,
+      weight: 700,
+      fill: muted,
+    }
+  );
+
+  svg += makeText(
+    700,
+    460,
+    "CONTRIBUTED",
+    {
+      size: 16,
+      weight: 700,
+      fill: muted,
+      anchor: "end",
+    }
+  );
+
+  svg += makeText(
+    880,
+    460,
+    "+1H",
+    {
+      size: 16,
+      weight: 700,
+      fill: muted,
+      anchor: "end",
+    }
+  );
+
+  svg += makeText(
+    1050,
+    460,
+    "+24H",
+    {
+      size: 16,
+      weight: 700,
+      fill: muted,
+      anchor: "end",
+    }
+  );
+
+  svg += makeText(
+    1230,
+    460,
+    "SHARE",
+    {
+      size: 16,
+      weight: 700,
+      fill: muted,
+      anchor: "end",
+    }
+  );
+
+  svg += makeText(
+    1515,
+    460,
+    "UPDATED",
+    {
+      size: 16,
+      weight: 700,
+      fill: muted,
+      anchor: "end",
+    }
+  );
+
+  const totalPoints =
+    players.reduce(
+      (sum, player) =>
+        sum + Number(player.points || 0),
+      0
+    );
+
+  const rowHeight = 62;
+
+  players.forEach((player, index) => {
+    const y = 480 + index * rowHeight;
+    const color =
+      PLAYER_COLORS[index];
+
+    if (index > 0) {
+      svg += `
+        <line
+          x1="70"
+          y1="${y - 5}"
+          x2="${width - 70}"
+          y2="${y - 5}"
+          stroke="${border}"
+          stroke-width="1"
+        />
+      `;
+    }
+
+    svg += `
+      <rect
+        x="52"
+        y="${y + 8}"
+        width="6"
+        height="42"
+        rx="3"
+        fill="${color}"
+      />
+    `;
+
+    /*
+      Avatar
+    */
+
+    const avatar =
+      avatarBuffers.get(player.userId);
+
+    if (avatar) {
+      const avatarData =
+        avatar.toString("base64");
+
+      svg += `
+        <defs>
+          <clipPath id="avatar-${index}">
+            <circle
+              cx="105"
+              cy="${y + 29}"
+              r="23"
+            />
+          </clipPath>
+        </defs>
+
+        <circle
+          cx="105"
+          cy="${y + 29}"
+          r="25"
+          fill="#343a43"
+        />
+
+        <image
+          href="data:image/png;base64,${avatarData}"
+          x="80"
+          y="${y + 4}"
+          width="50"
+          height="50"
+          preserveAspectRatio="xMidYMid slice"
+          clip-path="url(#avatar-${index})"
+        />
+      `;
+    } else {
+      svg += `
+        <circle
+          cx="105"
+          cy="${y + 29}"
+          r="25"
+          fill="#343a43"
+        />
+      `;
+    }
+
+    const name =
+      String(player.displayName || player.userId);
+
+    const points =
+      Number(player.points) || 0;
+
+    const delta1h =
+      getDelta(
+        state,
+        player.userId,
+        points,
+        60 * 60 * 1000
+      );
+
+    const delta24h =
+      getDelta(
+        state,
+        player.userId,
+        points,
+        24 * 60 * 60 * 1000
+      );
+
+    const share =
+      totalPoints > 0
+        ? (points / totalPoints) * 100
+        : 0;
+
+    let updated = "—";
+
+    if (player.timestamp) {
+      updated =
+        new Date(
+          player.timestamp * 1000
+        ).toLocaleTimeString(
+          "en-US",
+          {
+            hour: "2-digit",
+            minute: "2-digit",
+          }
+        );
+    }
+
+    svg += makeText(
+      170,
+      y + 28,
+      name.length > 22
+        ? `${name.slice(0, 21)}…`
+        : name,
+      {
+        size: 22,
+        weight: 700,
+        fill: white,
       }
     );
 
-    if (!response.ok) {
-      return null;
-    }
-
-    const json =
-      await response.json();
-
-    const imageUrl =
-      json?.data?.[0]?.imageUrl;
-
-    if (!imageUrl) {
-      return null;
-    }
-
-    const imageResponse =
-      await fetch(
-        imageUrl,
-        {
-          signal:
-            AbortSignal.timeout(10000),
-        }
-      );
-
-    if (!imageResponse.ok) {
-      return null;
-    }
-
-    const buffer =
-      Buffer.from(
-        await imageResponse.arrayBuffer()
-      );
-
-    return await sharp(buffer)
-      .resize(64, 64, {
-        fit: 'cover',
-      })
-      .png()
-      .toBuffer();
-  } catch {
-    return null;
-  }
-}
-
-/* =========================================================
-   LEAGUE ICON
-========================================================= */
-
-async function getLeagueIcon(
-  icon
-) {
-  const match =
-    String(icon || '').match(
-      /rbxassetid:\/\/(\d+)/i
+    svg += makeText(
+      170,
+      y + 48,
+      `ID ${player.userId}`,
+      {
+        size: 13,
+        weight: 500,
+        fill: muted,
+      }
     );
 
-  if (!match) {
-    return null;
-  }
-
-  try {
-    const response =
-      await fetch(
-        'https://thumbnails.roblox.com/v1/assets' +
-          `?assetIds=${match[1]}` +
-          '&returnPolicy=PlaceHolder' +
-          '&size=420x420' +
-          '&format=Png' +
-          '&isCircular=false',
-        {
-          headers: {
-            accept:
-              'application/json',
-          },
-          signal:
-            AbortSignal.timeout(10000),
-        }
-      );
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const json =
-      await response.json();
-
-    const imageUrl =
-      json?.data?.[0]?.imageUrl;
-
-    if (!imageUrl) {
-      return null;
-    }
-
-    const image =
-      await fetch(
-        imageUrl,
-        {
-          signal:
-            AbortSignal.timeout(10000),
-        }
-      );
-
-    if (!image.ok) {
-      return null;
-    }
-
-    return Buffer.from(
-      await image.arrayBuffer()
+    svg += makeText(
+      700,
+      y + 37,
+      formatPoints(points),
+      {
+        size: 23,
+        weight: 800,
+        fill: color,
+        anchor: "end",
+      }
     );
-  } catch {
-    return null;
-  }
-}
 
-/* =========================================================
-   DASHBOARD IMAGE
-   NO NESTED SVG
-========================================================= */
-
-async function makeLeagueCard(
-  league,
-  contributors,
-  history,
-  rank
-) {
-  const width = 1400;
-
-  const headerHeight = 205;
-  const rowHeight = 82;
-  const tableHeaderHeight = 50;
-  const gap = 25;
-
-  const chartHeight = 400;
-
-  const tableHeight =
-    tableHeaderHeight +
-    contributors.length *
-      rowHeight;
-
-  const chartTop =
-    headerHeight +
-    tableHeight +
-    gap;
-
-  const height =
-    chartTop +
-    chartHeight +
-    30;
-
-  const colors = [
-    '#14c7ff',
-    '#ff3baa',
-    '#ffae1a',
-    '#39dfaa',
-  ];
-
-  const avatars =
-    await Promise.all(
-      contributors.map(
-        member =>
-          getAvatar(
-            member.userId
-          )
-      )
+    svg += makeText(
+      880,
+      y + 37,
+      formatDelta(delta1h),
+      {
+        size: 20,
+        weight: 700,
+        fill:
+          delta1h === null
+            ? muted
+            : white,
+        anchor: "end",
+      }
     );
+
+    svg += makeText(
+      1050,
+      y + 37,
+      formatDelta(delta24h),
+      {
+        size: 20,
+        weight: 700,
+        fill:
+          delta24h === null
+            ? muted
+            : white,
+        anchor: "end",
+      }
+    );
+
+    svg += makeText(
+      1230,
+      y + 37,
+      `${share.toFixed(1)}%`,
+      {
+        size: 20,
+        weight: 700,
+        fill: color,
+        anchor: "end",
+      }
+    );
+
+    svg += makeText(
+      1515,
+      y + 37,
+      updated,
+      {
+        size: 18,
+        weight: 600,
+        fill: muted,
+        anchor: "end",
+      }
+    );
+  });
 
   /*
-   * Chart is drawn DIRECTLY inside this SVG.
-   * No SVG inside SVG.
-   */
+    Chart
+  */
 
-  const chartLeft = 85;
-  const chartRight = 40;
-  const chartTopInner =
-    chartTop + 45;
-  const chartBottom =
-    chartTop + chartHeight - 45;
+  const chartX = 36;
+  const chartY = 755;
+  const chartW = width - 72;
+  const chartH = 270;
 
-  const chartWidth =
-    width -
-    chartLeft -
-    chartRight;
-
-  const chartUsableHeight =
-    chartBottom -
-    chartTopInner;
-
-  const snapshots =
-    history.slice(-25);
-
-  const maxValue =
-    Math.max(
-      1,
-      ...snapshots.flatMap(
-        snapshot =>
-          (
-            snapshot.members ||
-            []
-          ).map(
-            member =>
-              Number(
-                member.points || 0
-              )
-          )
-      )
-    );
-
-  const yMax =
-    Math.ceil(
-      maxValue /
-        500000
-    ) *
-      500000 ||
-    maxValue;
-
-  function chartX(index) {
-    if (snapshots.length <= 1) {
-      return (
-        chartLeft +
-        chartWidth / 2
-      );
+  svg += makeText(
+    55,
+    745,
+    "CONTRIBUTION HISTORY — LAST 24H",
+    {
+      size: 20,
+      weight: 800,
+      fill: white,
     }
+  );
 
-    return (
-      chartLeft +
-      (index /
-        (snapshots.length -
-          1)) *
-        chartWidth
+  svg += makeRoundedRect(
+    chartX,
+    chartY,
+    chartW,
+    chartH,
+    24,
+    panel,
+    border,
+    2
+  );
+
+  const historyStart =
+    Date.now() -
+    24 * 60 * 60 * 1000;
+
+  const history =
+    state.snapshots.filter(
+      (snapshot) =>
+        Number(snapshot.timestamp) >=
+        historyStart
     );
+
+  let maxValue = 1;
+
+  for (const player of players) {
+    for (const snapshot of history) {
+      const value =
+        Number(
+          snapshot.players?.[
+            player.userId
+          ]
+        ) || 0;
+
+      maxValue =
+        Math.max(maxValue, value);
+    }
   }
 
-  function chartY(value) {
-    return (
-      chartBottom -
-      (Number(value || 0) /
-        yMax) *
-        chartUsableHeight
-    );
-  }
+  /*
+    Grid
+  */
 
-  const grid = [];
+  const plotLeft = chartX + 75;
+  const plotRight = chartX + chartW - 30;
+  const plotTop = chartY + 25;
+  const plotBottom =
+    chartY + chartH - 45;
 
-  for (
-    let i = 0;
-    i <= 5;
-    i++
-  ) {
-    const value =
-      (yMax / 5) * i;
+  const plotW =
+    plotRight - plotLeft;
 
+  const plotH =
+    plotBottom - plotTop;
+
+  for (let i = 0; i <= 4; i++) {
     const y =
-      chartY(value);
+      plotTop +
+      (plotH / 4) * i;
 
-    grid.push(`
+    svg += `
       <line
-        x1="${chartLeft}"
+        x1="${plotLeft}"
         y1="${y}"
-        x2="${chartLeft + chartWidth}"
+        x2="${plotRight}"
         y2="${y}"
-        stroke="#303238"
+        stroke="#30363e"
         stroke-width="1"
       />
+    `;
 
-      <text
-        x="${chartLeft - 12}"
-        y="${y + 5}"
-        text-anchor="end"
-        fill="#858891"
-        font-size="15"
-        font-family="Arial"
-      >
-        ${xmlEscape(
-          formatCompact(
-            value
-          )
-        )}
-      </text>
-    `);
+    const value =
+      maxValue -
+      (maxValue / 4) * i;
+
+    svg += makeText(
+      plotLeft - 12,
+      y + 6,
+      formatPoints(value),
+      {
+        size: 14,
+        weight: 600,
+        fill: muted,
+        anchor: "end",
+      }
+    );
   }
 
-  const chartSeries =
-    contributors
-      .map(
-        (member, seriesIndex) => {
-          const color =
-            colors[
-              seriesIndex %
-                colors.length
-            ];
+  /*
+    X-axis labels
+  */
 
-          const values =
-            snapshots.map(
-              snapshot => {
-                const found =
-                  snapshot.members?.find(
-                    item =>
-                      String(
-                        item.userId
-                      ) ===
-                      String(
-                        member.userId
-                      )
-                  );
+  const now = Date.now();
 
-                return Number(
-                  found?.points || 0
-                );
-              }
-            );
+  const labels = [
+    {
+      x: plotLeft,
+      text: "24H",
+    },
+    {
+      x: plotLeft + plotW * 0.25,
+      text: "18H",
+    },
+    {
+      x: plotLeft + plotW * 0.5,
+      text: "12H",
+    },
+    {
+      x: plotLeft + plotW * 0.75,
+      text: "6H",
+    },
+    {
+      x: plotRight,
+      text: "NOW",
+    },
+  ];
 
-          if (!values.length) {
-            return '';
-          }
-
-          const linePoints =
-            values
-              .map(
-                (
-                  value,
-                  index
-                ) =>
-                  `${chartX(
-                    index
-                  )},${chartY(
-                    value
-                  )}`
-              )
-              .join(' ');
-
-          const areaPoints =
-            `${chartX(0)},${chartBottom} ` +
-            linePoints +
-            ` ${chartX(
-              values.length - 1
-            )},${chartBottom}`;
-
-          const dots =
-            values
-              .map(
-                (
-                  value,
-                  index
-                ) =>
-                  `
-                  <circle
-                    cx="${chartX(
-                      index
-                    )}"
-                    cy="${chartY(
-                      value
-                    )}"
-                    r="4"
-                    fill="${color}"
-                  />
-                  `
-              )
-              .join('');
-
-          return `
-            <polygon
-              points="${areaPoints}"
-              fill="${color}"
-              opacity="0.08"
-            />
-
-            <polyline
-              points="${linePoints}"
-              fill="none"
-              stroke="${color}"
-              stroke-width="3"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-
-            ${dots}
-          `;
-        }
-      )
-      .join('');
-
-  const chartLabels =
-    snapshots
-      .map(
-        (snapshot, index) => {
-          if (
-            snapshots.length >
-              12 &&
-            index % 2 !== 0
-          ) {
-            return '';
-          }
-
-          const hours =
-            Math.round(
-              (Date.now() -
-                Number(
-                  snapshot.timestamp
-                )) /
-                3600000
-            );
-
-          const label =
-            hours <= 0
-              ? 'Now'
-              : `${hours}h`;
-
-          return `
-            <text
-              x="${chartX(index)}"
-              y="${chartBottom + 30}"
-              text-anchor="middle"
-              fill="#858891"
-              font-size="13"
-              font-family="Arial"
-            >
-              ${label}
-            </text>
-          `;
-        }
-      )
-      .join('');
-
-  /* =======================================================
-     HEADER
-  ======================================================= */
-
-  const leaguePoints =
-    Number(
-      league.Points || 0
+  for (const label of labels) {
+    svg += makeText(
+      label.x,
+      chartY + chartH - 15,
+      label.text,
+      {
+        size: 14,
+        weight: 700,
+        fill: muted,
+        anchor: "middle",
+      }
     );
+  }
 
-  const level =
-    Number(
-      league.Level || 1
-    );
+  /*
+    Player lines
+  */
 
-  const owner =
-    league.Owner?.DisplayName ||
-    league.Owner?.Username ||
-    'Unknown';
+  players.forEach((player, index) => {
+    const color =
+      PLAYER_COLORS[index];
 
-  const capacity =
-    Number(
-      league.MemberCapacity ||
-        contributors.length ||
-        4
-    );
+    const points = [];
 
-  /* =======================================================
-     TABLE
-  ======================================================= */
+    if (history.length === 0) {
+      const current =
+        Number(player.points) || 0;
 
-  const tableStart =
-    headerHeight;
+      points.push({
+        timestamp: now,
+        value: current,
+      });
+    } else {
+      for (const snapshot of history) {
+        const value =
+          Number(
+            snapshot.players?.[
+              player.userId
+            ]
+          ) || 0;
 
-  const tableHeaderY =
-    tableStart + 31;
+        points.push({
+          timestamp:
+            Number(snapshot.timestamp),
+          value,
+        });
+      }
 
-  const rowStart =
-    tableStart +
-    tableHeaderHeight;
+      /*
+        Add current value as final point.
+      */
+      points.push({
+        timestamp: now,
+        value:
+          Number(player.points) || 0,
+      });
+    }
 
-  const tableHeaders = `
-    <text
-      x="35"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      #
-    </text>
-
-    <text
-      x="115"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      PLAYER
-    </text>
-
-    <text
-      x="650"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      POINTS
-    </text>
-
-    <text
-      x="810"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      +1H
-    </text>
-
-    <text
-      x="920"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      +24H
-    </text>
-
-    <text
-      x="1050"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      LAST
-    </text>
-
-    <text
-      x="1205"
-      y="${tableHeaderY}"
-      fill="#8f9199"
-      font-size="15"
-      font-weight="700"
-      font-family="Arial"
-    >
-      SHARE
-    </text>
-  `;
-
-  const rows =
-    contributors
-      .map(
-        (member, index) => {
-          const y =
-            rowStart +
-            index * rowHeight;
-
-          const color =
-            colors[
-              index %
-                colors.length
-            ];
-
-          const delta1h =
-            getMemberDelta(
-              history,
-              member.userId,
+    const linePoints =
+      points
+        .map((point) => {
+          const ratio =
+            clamp(
+              (point.timestamp -
+                historyStart) /
+                (24 * 60 * 60 * 1000),
+              0,
               1
             );
 
-          const delta24h =
-            getMemberDelta(
-              history,
-              member.userId,
-              24
-            );
+          const x =
+            plotLeft +
+            ratio * plotW;
 
-          const share =
-            leaguePoints > 0
-              ? (member.points /
-                  leaguePoints) *
-                100
-              : 0;
+          const y =
+            plotBottom -
+            (point.value / maxValue) *
+              plotH;
 
-          const avatar =
-            avatars[index];
+          return `${x.toFixed(1)},${y.toFixed(
+            1
+          )}`;
+        })
+        .join(" ");
 
-          const avatarSvg =
-            avatar
-              ? `
-                <image
-                  href="data:image/png;base64,${avatar.toString(
-                    'base64'
-                  )}"
-                  x="48"
-                  y="${y + 9}"
-                  width="62"
-                  height="62"
-                />
-              `
-              : `
-                <circle
-                  cx="79"
-                  cy="${y + 40}"
-                  r="31"
-                  fill="#373940"
-                />
-              `;
-
-          return `
-            <rect
-              x="20"
-              y="${y}"
-              width="${width - 40}"
-              height="${rowHeight - 4}"
-              rx="10"
-              fill="#202428"
-            />
-
-            <rect
-              x="20"
-              y="${y}"
-              width="5"
-              height="${rowHeight - 4}"
-              rx="2"
-              fill="${color}"
-            />
-
-            <text
-              x="35"
-              y="${y + 48}"
-              fill="${color}"
-              font-size="20"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ${index + 1}
-            </text>
-
-            ${avatarSvg}
-
-            <text
-              x="125"
-              y="${y + 48}"
-              fill="#f1f2f4"
-              font-size="21"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ${xmlEscape(
-                shorten(
-                  member.name,
-                  28
-                )
-              )}
-            </text>
-
-            <text
-              x="650"
-              y="${y + 48}"
-              fill="${color}"
-              font-size="21"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ★ ${xmlEscape(
-                formatCompact(
-                  member.points
-                )
-              )}
-            </text>
-
-            <text
-              x="810"
-              y="${y + 48}"
-              fill="#f1f2f4"
-              font-size="20"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ${xmlEscape(
-                formatDelta(
-                  delta1h
-                )
-              )}
-            </text>
-
-            <text
-              x="920"
-              y="${y + 48}"
-              fill="#f1f2f4"
-              font-size="20"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ${xmlEscape(
-                formatDelta(
-                  delta24h
-                )
-              )}
-            </text>
-
-            <text
-              x="1050"
-              y="${y + 48}"
-              fill="#dfe0e4"
-              font-size="20"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ${member.timestamp
-                ? new Date(
-                    member.timestamp *
-                      1000
-                  ).toLocaleTimeString(
-                    'en-GB',
-                    {
-                      hour: '2-digit',
-                      minute:
-                        '2-digit',
-                    }
-                  )
-                : '—'}
-            </text>
-
-            <text
-              x="1205"
-              y="${y + 48}"
-              fill="${color}"
-              font-size="20"
-              font-weight="700"
-              font-family="Arial"
-            >
-              ${share.toFixed(
-                1
-              )}%
-            </text>
-          `;
-        }
-      )
-      .join('');
-
-  /* =======================================================
-     FINAL SVG
-  ======================================================= */
-
-  const svg = `
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="${width}"
-      height="${height}"
-      viewBox="0 0 ${width} ${height}"
-    >
-
-      <rect
-        width="${width}"
-        height="${height}"
-        rx="22"
-        fill="#1b1d20"
+    svg += `
+      <polyline
+        points="${linePoints}"
+        fill="none"
+        stroke="${color}"
+        stroke-width="4"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity="0.95"
       />
+    `;
 
-      <rect
-        x="10"
-        y="10"
-        width="${width - 20}"
-        height="${height - 20}"
-        rx="22"
-        fill="#24272b"
+    /*
+      Current point
+    */
+
+    const currentX = plotRight;
+
+    const currentValue =
+      Number(player.points) || 0;
+
+    const currentY =
+      plotBottom -
+      (currentValue / maxValue) *
+        plotH;
+
+    svg += `
+      <circle
+        cx="${currentX}"
+        cy="${currentY}"
+        r="6"
+        fill="${color}"
       />
+    `;
 
-      <!-- HEADER -->
+    /*
+      Legend
+    */
 
-      <text
-        x="45"
-        y="58"
-        fill="#f2f3f5"
-        font-size="34"
-        font-weight="800"
-        font-family="Arial"
-      >
-        ${xmlEscape(
-          league.Name ||
-            LEAGUE_NAME
-        )}
-      </text>
+    const legendX =
+      plotLeft +
+      index * 320;
 
-      <text
-        x="45"
-        y="101"
-        fill="#cfd1d6"
-        font-size="20"
-        font-family="Arial"
-      >
-        Global Rank
-      </text>
-
-      <text
-        x="45"
-        y="137"
-        fill="#ffffff"
-        font-size="28"
-        font-weight="800"
-        font-family="Arial"
-      >
-        ${formatRank(rank)}
-      </text>
-
-      <text
-        x="255"
-        y="101"
-        fill="#cfd1d6"
-        font-size="20"
-        font-family="Arial"
-      >
-        League Points
-      </text>
-
-      <text
-        x="255"
-        y="137"
-        fill="#ffffff"
-        font-size="28"
-        font-weight="800"
-        font-family="Arial"
-      >
-        ${formatNumber(
-          leaguePoints
-        )}
-      </text>
-
-      <text
-        x="520"
-        y="101"
-        fill="#cfd1d6"
-        font-size="20"
-        font-family="Arial"
-      >
-        Level
-      </text>
-
-      <text
-        x="520"
-        y="137"
-        fill="#ffffff"
-        font-size="28"
-        font-weight="800"
-        font-family="Arial"
-      >
-        ${level}
-      </text>
-
-      <text
-        x="690"
-        y="101"
-        fill="#cfd1d6"
-        font-size="20"
-        font-family="Arial"
-      >
-        Members
-      </text>
-
-      <text
-        x="690"
-        y="137"
-        fill="#ffffff"
-        font-size="28"
-        font-weight="800"
-        font-family="Arial"
-      >
-        ${contributors.length}/${capacity}
-      </text>
-
-      <text
-        x="900"
-        y="101"
-        fill="#cfd1d6"
-        font-size="20"
-        font-family="Arial"
-      >
-        Owner
-      </text>
-
-      <text
-        x="900"
-        y="137"
-        fill="#ffffff"
-        font-size="22"
-        font-weight="700"
-        font-family="Arial"
-      >
-        ${xmlEscape(
-          shorten(owner, 24)
-        )}
-      </text>
-
-      <line
-        x1="35"
-        y1="165"
-        x2="${width - 35}"
-        y2="165"
-        stroke="#3b3d42"
-        stroke-width="1"
+    svg += `
+      <circle
+        cx="${legendX}"
+        cy="${chartY + 22}"
+        r="5"
+        fill="${color}"
       />
+    `;
 
-      <!-- TABLE -->
-
-      ${tableHeaders}
-
-      ${rows}
-
-      <!-- CHART -->
-
-      <text
-        x="45"
-        y="${chartTop + 25}"
-        fill="#f0f1f4"
-        font-size="20"
-        font-weight="700"
-        font-family="Arial"
-      >
-        Contribution History
-      </text>
-
-      ${grid.join('')}
-
-      ${chartSeries}
-
-      ${chartLabels}
-
-    </svg>
-  `;
-
-  await sharp(
-    Buffer.from(svg)
-  )
-    .png()
-    .toFile(CARD_FILE);
-
-  return CARD_FILE;
-}
-
-/* =========================================================
-   RANK CHANGE
-========================================================= */
-
-function getPassedLeagues(
-  oldRank,
-  newRank,
-  oldRanking,
-  currentRanking
-) {
-  if (
-    !Array.isArray(oldRanking) ||
-    !Array.isArray(currentRanking)
-  ) {
-    return [];
-  }
-
-  if (newRank < oldRank) {
-    return oldRanking.slice(
-      newRank - 1,
-      oldRank - 1
-    );
-  }
-
-  return currentRanking.slice(
-    oldRank,
-    newRank
-  );
-}
-
-function createRankEmbed(
-  oldRank,
-  newRank,
-  points,
-  movedLeagues
-) {
-  const increased =
-    newRank < oldRank;
-
-  const amount =
-    Math.abs(
-      oldRank - newRank
-    );
-
-  const embed =
-    new EmbedBuilder()
-      .setTitle(
-        increased
-          ? `📈 ${LEAGUE_NAME} — Increased!`
-          : `📉 ${LEAGUE_NAME} — Decreased!`
-      )
-      .setDescription(
-        increased
-          ? `**${LEAGUE_NAME}** increased **${amount} ${
-              amount === 1
-                ? 'position'
-                : 'positions'
-            }** in the League Leaderboard!`
-          : `**${LEAGUE_NAME}** decreased **${amount} ${
-              amount === 1
-                ? 'position'
-                : 'positions'
-            }** in the League Leaderboard!`
-      )
-      .addFields(
-        {
-          name:
-            '⬅️ Previous place',
-          value:
-            formatRank(
-              oldRank
-            ),
-          inline: true,
-        },
-        {
-          name:
-            '🏆 Current place',
-          value:
-            formatRank(
-              newRank
-            ),
-          inline: true,
-        },
-        {
-          name:
-            '💎 Points',
-          value:
-            formatNumber(
-              points
-            ),
-          inline: true,
-        },
-        {
-          name:
-            increased
-              ? '⬆️ Overtook'
-              : '⬇️ Overtaken by',
-          value:
-            movedLeagues.length
-              ? movedLeagues
-                  .slice(
-                    0,
-                    10
-                  )
-                  .map(
-                    name =>
-                      `• **${name}**`
-                  )
-                  .join('\n')
-              : '• —',
-          inline: false,
-        }
-      )
-      .setFooter({
-        text:
-          'MGKK League • MADE BY BRAT',
-      })
-      .setTimestamp();
-
-  return embed;
-}
-
-async function sendRankChange(
-  oldRank,
-  newRank,
-  points,
-  movedLeagues
-) {
-  const channel =
-    await client.channels.fetch(
-      CHANNEL_ID
-    );
-
-  if (
-    !channel ||
-    !channel.isTextBased()
-  ) {
-    throw new Error(
-      'Discord channel is invalid'
-    );
-  }
-
-  const payload = {
-    embeds: [
-      createRankEmbed(
-        oldRank,
-        newRank,
-        points,
-        movedLeagues
-      ),
-    ],
-  };
-
-  /*
-   * IMPORTANT:
-   * Logo is now a SMALL thumbnail,
-   * not a giant image above the embed.
-   */
-  if (
-    fs.existsSync(
-      LOGO_FILE
-    )
-  ) {
-    payload.files = [
-      new AttachmentBuilder(
-        LOGO_FILE,
-        {
-          name:
-            'mgkk-logo.png',
-        }
-      ),
-    ];
-
-    payload.embeds[0].setThumbnail(
-      'attachment://mgkk-logo.png'
-    );
-  }
-
-  await channel.send(
-    payload
-  );
-}
-
-/* =========================================================
-   DASHBOARD MESSAGE
-========================================================= */
-
-async function sendDashboard(
-  league,
-  contributors,
-  history,
-  rank,
-  oldMessageId
-) {
-  const channel =
-    await client.channels.fetch(
-      CHANNEL_ID
-    );
-
-  if (
-    !channel ||
-    !channel.isTextBased()
-  ) {
-    throw new Error(
-      'Discord channel is invalid'
-    );
-  }
-
-  const card =
-    await makeLeagueCard(
-      league,
-      contributors,
-      history,
-      rank
-    );
-
-  const file =
-    new AttachmentBuilder(
-      card,
+    svg += makeText(
+      legendX + 12,
+      chartY + 27,
+      player.displayName,
       {
-        name:
-          'mgkk-dashboard.png',
+        size: 15,
+        weight: 700,
+        fill: white,
       }
     );
+  });
 
-  /*
-   * Try to update the same message.
-   */
-  if (oldMessageId) {
+  svg += makeText(
+    width - 55,
+    height - 18,
+    "MGKK • BIG Games API",
+    {
+      size: 13,
+      weight: 600,
+      fill: muted,
+      anchor: "end",
+    }
+  );
+
+  svg += "</svg>";
+
+  return svg;
+}
+
+/* =========================================================
+   RENDER PNG
+========================================================= */
+
+async function renderDashboard({
+  league,
+  rank,
+  players,
+  state,
+}) {
+  const userIds =
+    players.map(
+      (player) => player.userId
+    );
+
+  const avatarUrls =
+    await getAvatarUrl(userIds);
+
+  const avatarBuffers =
+    new Map();
+
+  for (const player of players) {
+    const url =
+      avatarUrls.get(player.userId);
+
+    if (!url) {
+      continue;
+    }
+
     try {
-      const message =
-        await channel.messages.fetch(
-          oldMessageId
-        );
+      const buffer =
+        await downloadBuffer(url);
 
-      await message.edit({
-        content: '',
-        embeds: [],
-        files: [file],
-      });
-
-      console.log(
-        `[DASHBOARD] Updated ${message.id}`
+      avatarBuffers.set(
+        player.userId,
+        buffer
       );
-
-      return message.id;
     } catch (error) {
       console.warn(
-        `[DASHBOARD] Existing message unavailable: ${error.message}`
+        `Avatar failed for ${player.userId}:`,
+        error.message
       );
     }
   }
 
-  /*
-   * No existing message -> create exactly one.
-   */
-  const message =
-    await channel.send({
-      files: [file],
-    });
-
-  console.log(
-    `[DASHBOARD] Created ${message.id}`
-  );
-
-  return message.id;
-}
-
-/* =========================================================
-   MAIN CHECK
-========================================================= */
-
-async function check() {
-  console.log(
-    `[${new Date().toISOString()}] Checking ${LEAGUE_NAME}...`
-  );
-
-  const [
+  const svg = makeDashboardSvg({
     league,
-    rankingData,
-  ] = await Promise.all([
-    getLeague(),
-    getLeagueRanking(),
-  ]);
-
-  if (
-    !league ||
-    typeof league !== 'object'
-  ) {
-    throw new Error(
-      'Invalid league data'
-    );
-  }
-
-  const points =
-    Number(
-      league.Points || 0
-    );
-
-  if (!Number.isFinite(points)) {
-    throw new Error(
-      'Invalid league points'
-    );
-  }
-
-  const contributors =
-    await getContributors(
-      league
-    );
-
-  const state =
-    loadState();
-
-  const snapshot =
-    createSnapshot(
-      league,
-      contributors
-    );
-
-  const history =
-    trimHistory([
-      ...state.history,
-      snapshot,
-    ]);
-
-  const rank =
-    rankingData.rank;
-
-  console.log(
-    `${LEAGUE_NAME} ${formatRank(
-      rank
-    )} | ${formatNumber(
-      points
-    )} points`
-  );
-
-  console.log(
-    contributors
-      .map(
-        member =>
-          `${member.name}: ${formatCompact(
-            member.points
-          )}`
-      )
-      .join(' | ')
-  );
-
-  /*
-   * Rank notification.
-   */
-  const firstRun =
-    state.rank === null ||
-    !Number.isFinite(
-      Number(state.rank)
-    );
-
-  if (
-    !firstRun &&
-    Number(state.rank) !== rank
-  ) {
-    const moved =
-      getPassedLeagues(
-        Number(state.rank),
-        rank,
-        state.ranking,
-        rankingData.ranking
-      );
-
-    await sendRankChange(
-      Number(state.rank),
-      rank,
-      points,
-      moved
-    );
-
-    console.log(
-      `[RANK] ${state.rank} -> ${rank}`
-    );
-  }
-
-  /*
-   * Dashboard.
-   */
-  const dashboardMessageId =
-    await sendDashboard(
-      league,
-      contributors,
-      history,
-      rank,
-      state.dashboardMessageId
-    );
-
-  saveState({
     rank,
-    points,
-    ranking:
-      rankingData.ranking,
-    history,
-    dashboardMessageId,
-    lastCheck:
-      new Date().toISOString(),
+    players,
+    state,
+    avatarBuffers,
   });
 
-  console.log(
-    '[DONE] Check completed successfully.'
-  );
+  return sharp(
+    Buffer.from(svg)
+  )
+    .png({
+      compressionLevel: 9,
+      quality: 100,
+    })
+    .toBuffer();
 }
 
 /* =========================================================
    DISCORD
 ========================================================= */
 
-client.once(
-  'ready',
-  async () => {
-    console.log(
-      '================================'
+async function getDiscordChannel(client) {
+  const channel =
+    await client.channels.fetch(
+      DISCORD_CHANNEL_ID
     );
 
-    console.log(
-      `Logged in as ${client.user.tag}`
+  if (!channel) {
+    throw new Error(
+      "Discord channel was not found."
     );
+  }
 
-    console.log(
-      `League: ${LEAGUE_NAME}`
+  if (
+    !channel.isTextBased() ||
+    !channel.messages
+  ) {
+    throw new Error(
+      "DISCORD_CHANNEL_ID is not a text channel."
     );
+  }
 
-    console.log(
-      '================================'
-    );
+  return channel;
+}
 
+async function updateDashboardMessage(
+  channel,
+  state,
+  pngBuffer,
+  league,
+  rank
+) {
+  const attachment = {
+    attachment: pngBuffer,
+    name: "mgkk-dashboard.png",
+    description:
+      "MGKK League dashboard",
+  };
+
+  /*
+    Try editing the existing dashboard.
+  */
+
+  if (state.dashboardMessageId) {
     try {
-      await check();
-    } catch (error) {
-      console.error(
-        `[CHECK ERROR] ${
-          error?.stack ||
-          error?.message ||
-          error
-        }`
+      const message =
+        await channel.messages.fetch(
+          state.dashboardMessageId
+        );
+
+      await message.edit({
+        content: "",
+        embeds: [],
+        files: [attachment],
+      });
+
+      console.log(
+        `Dashboard updated: ${message.id}`
       );
 
-      process.exitCode = 1;
-    } finally {
-      await client.destroy();
+      return message.id;
+    } catch (error) {
+      console.warn(
+        "Existing dashboard message could not be edited:",
+        error.message
+      );
+
+      state.dashboardMessageId = null;
     }
   }
-);
 
-client.on(
-  'error',
-  error => {
-    console.error(
-      `[DISCORD ERROR] ${error.message}`
-    );
-  }
-);
+  /*
+    Create it once if there isn't one.
+  */
 
-process.on(
-  'unhandledRejection',
-  error => {
-    console.error(
-      '[UNHANDLED REJECTION]',
-      error
-    );
+  const message =
+    await channel.send({
+      content: "",
+      files: [attachment],
+    });
 
-    process.exitCode = 1;
-  }
-);
+  state.dashboardMessageId =
+    message.id;
 
-process.on(
-  'uncaughtException',
-  error => {
-    console.error(
-      '[UNCAUGHT EXCEPTION]',
-      error
-    );
-
-    process.exitCode = 1;
-  }
-);
-
-client.login(
-  TOKEN
-).catch(error => {
-  console.error(
-    `[LOGIN ERROR] ${error.message}`
+  console.log(
+    `Dashboard created: ${message.id}`
   );
 
-  process.exit(1);
+  return message.id;
+}
+
+/* =========================================================
+   RANK CHANGE NOTIFICATION
+========================================================= */
+
+async function sendRankNotification(
+  channel,
+  league,
+  previousRank,
+  currentRank
+) {
+  if (
+    !Number.isFinite(previousRank) ||
+    !Number.isFinite(currentRank)
+  ) {
+    return;
+  }
+
+  if (previousRank === currentRank) {
+    return;
+  }
+
+  const difference =
+    previousRank - currentRank;
+
+  const improved = difference > 0;
+
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        improved
+          ? "📈 MGKK — Increased!"
+          : "📉 MGKK — Decreased"
+      )
+      .setDescription(
+        improved
+          ? `**${league.Name}** moved **${Math.abs(
+              difference
+            )} position${
+              Math.abs(difference) === 1
+                ? ""
+                : "s"
+            } up** in the League leaderboard.`
+          : `**${league.Name}** moved **${Math.abs(
+              difference
+            )} position${
+              Math.abs(difference) === 1
+                ? ""
+                : "s"
+            } down** in the League leaderboard.`
+      )
+      .addFields(
+        {
+          name: "⬅️ Previous place",
+          value: `#${previousRank}`,
+          inline: true,
+        },
+        {
+          name: "🏆 Current place",
+          value: `#${currentRank}`,
+          inline: true,
+        },
+        {
+          name: "💎 Points",
+          value: formatFullPoints(
+            Number(league.Points) || 0
+          ),
+          inline: true,
+        }
+      )
+      .setFooter({
+        text: "MGKK League • BIG Games API",
+      })
+      .setTimestamp();
+
+  await channel.send({
+    embeds: [embed],
+  });
+}
+
+/* =========================================================
+   MAIN
+========================================================= */
+
+async function main() {
+  const state = loadState();
+
+  console.log(
+    `Checking league ${LEAGUE_NAME}...`
+  );
+
+  /*
+    1. Get actual league data.
+  */
+
+  const league =
+    await getLeague();
+
+  /*
+    2. Build roster from Owner + Members.
+  */
+
+  const players =
+    buildPlayers(league);
+
+  if (players.length === 0) {
+    throw new Error(
+      "League has no Owner/Members in API response."
+    );
+  }
+
+  console.log(
+    `League: ${league.Name}`
+  );
+
+  console.log(
+    `Points: ${formatFullPoints(
+      league.Points
+    )}`
+  );
+
+  console.log(
+    `Roster: ${players
+      .map(
+        (player) =>
+          `${player.displayName}=${formatPoints(
+            player.points
+          )}`
+      )
+      .join(", ")}`
+  );
+
+  /*
+    3. Calculate current rank.
+  */
+
+  const currentRank =
+    await getLeagueRank(
+      Number(league.Points) || 0,
+      state.previousRank
+    );
+
+  console.log(
+    `Rank: ${currentRank ?? "unknown"}`
+  );
+
+  /*
+    4. Add real API snapshot.
+  */
+
+  const now =
+    Date.now();
+
+  /*
+    Prevent duplicate snapshots if GitHub somehow
+    runs the job twice within a minute.
+  */
+
+  const lastSnapshot =
+    state.snapshots[
+      state.snapshots.length - 1
+    ];
+
+  if (
+    !lastSnapshot ||
+    now -
+      Number(lastSnapshot.timestamp) >=
+      60_000
+  ) {
+    addSnapshot(
+      state,
+      players,
+      now
+    );
+  }
+
+  /*
+    5. Discord.
+  */
+
+  const client =
+    new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+      ],
+    });
+
+  await client.login(
+    DISCORD_TOKEN
+  );
+
+  try {
+    const channel =
+      await getDiscordChannel(
+        client
+      );
+
+    /*
+      Rank notification BEFORE updating stored rank.
+    */
+
+    if (
+      currentRank !== null &&
+      Number.isFinite(currentRank)
+    ) {
+      await sendRankNotification(
+        channel,
+        league,
+        state.previousRank,
+        currentRank
+      );
+
+      state.previousRank =
+        currentRank;
+    }
+
+    /*
+      6. Generate ONE dashboard image.
+    */
+
+    const pngBuffer =
+      await renderDashboard({
+        league,
+        rank: currentRank,
+        players,
+        state,
+      });
+
+    /*
+      7. Update the SAME Discord message.
+    */
+
+    await updateDashboardMessage(
+      channel,
+      state,
+      pngBuffer,
+      league,
+      currentRank
+    );
+  } finally {
+    client.destroy();
+  }
+
+  /*
+    8. Save state.
+  */
+
+  saveState(state);
+
+  console.log(
+    "MGKK check completed successfully."
+  );
+}
+
+main().catch((error) => {
+  console.error(
+    "MGKK BOT ERROR:"
+  );
+  console.error(error);
+
+  process.exitCode = 1;
 });
