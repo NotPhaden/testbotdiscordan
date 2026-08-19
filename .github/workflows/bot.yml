@@ -1,17 +1,57 @@
-{
-  "name": "mgkk-discord-bot",
-  "version": "2.0.0",
-  "description": "MGKK League Discord rank monitor",
-  "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
-  "engines": {
-    "node": "24.x"
-  },
-  "dependencies": {
-    "discord.js": "^14.22.1",
-    "dotenv": "^17.2.1",
-    "sharp": "0.34.5"
-  }
-}
+name: MGKK Discord Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mgkk-bot
+  cancel-in-progress: false
+
+jobs:
+  check-rank:
+    runs-on: ubuntu-latest
+
+    env:
+      DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      LEAGUE_NAME: MGKK
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Check MGKK rank
+        run: node bot.js
+
+      - name: Save updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- state.json; then
+            echo "state.json did not change."
+            exit 0
+          fi
+
+          git add state.json
+
+          git commit -m "chore: update MGKK rank state"
+
+          git pull --rebase origin main
+
+          git push origin main
