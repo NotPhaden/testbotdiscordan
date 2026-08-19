@@ -1,11 +1,11 @@
 const fs = require("fs");
 const path = require("path");
-const https = require("https");
 const sharp = require("sharp");
 
 const {
   Client,
   GatewayIntentBits,
+  AttachmentBuilder,
   EmbedBuilder,
 } = require("discord.js");
 
@@ -15,161 +15,503 @@ require("dotenv").config();
    CONFIG
 ========================================================= */
 
-const API_BASE = "https://ps99.biggamesapi.io/v1";
-
-const LEAGUE_NAME =
-  process.env.LEAGUE_NAME || "MGKK";
-
-const DISCORD_TOKEN =
-  process.env.DISCORD_TOKEN;
-
-const DISCORD_CHANNEL_ID =
-  process.env.DISCORD_CHANNEL_ID;
-
-const STATE_FILE =
-  path.join(process.cwd(), "state.json");
-
-const HISTORY_RETENTION =
-  7 * 24 * 60 * 60 * 1000;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const LEAGUE_NAME = process.env.LEAGUE_NAME || "MGKK";
 
 if (!DISCORD_TOKEN) {
-  throw new Error(
-    "DISCORD_TOKEN is missing."
-  );
+  throw new Error("Missing DISCORD_TOKEN secret.");
 }
 
 if (!DISCORD_CHANNEL_ID) {
-  throw new Error(
-    "DISCORD_CHANNEL_ID is missing."
+  throw new Error("Missing DISCORD_CHANNEL_ID secret.");
+}
+
+const API_BASE = "https://ps99.biggamesapi.io";
+
+const ROBLOX_THUMBNAILS =
+  "https://thumbnails.roblox.com/v1/users/avatar-headshot";
+
+const STATE_FILE = path.join(__dirname, "state.json");
+
+const WIDTH = 1600;
+const HEIGHT = 1080;
+
+const COLORS = [
+  "#25C2F2",
+  "#F23AA5",
+  "#FFAA18",
+  "#3EE0B2",
+];
+
+/* =========================================================
+   DISCORD CLIENT
+========================================================= */
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
+
+/* =========================================================
+   HTTP
+========================================================= */
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await response.text();
+
+  let body;
+
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error(
+      `Invalid JSON received from API. HTTP ${response.status}`
+    );
+  }
+
+  if (!response.ok || body?.status === "error") {
+    const message =
+      body?.error?.message ||
+      body?.error?.code ||
+      `HTTP ${response.status}`;
+
+    throw new Error(`${message} — ${url}`);
+  }
+
+  return body?.data ?? body;
+}
+
+/* =========================================================
+   BIG GAMES API
+========================================================= */
+
+async function getLeague() {
+  const url =
+    `${API_BASE}/v1/leagues/` +
+    encodeURIComponent(LEAGUE_NAME);
+
+  return fetchJson(url);
+}
+
+async function getLeaguePage(page, pageSize = 100) {
+  const url =
+    `${API_BASE}/v1/leagues` +
+    `?page=${page}` +
+    `&pageSize=${pageSize}` +
+    `&sort=Points` +
+    `&sortOrder=desc`;
+
+  return fetchJson(url);
+}
+
+/* =========================================================
+   GLOBAL RANK
+========================================================= */
+
+async function getGlobalRank(targetLeague) {
+  const pageSize = 100;
+  const targetPoints = Number(targetLeague.Points || 0);
+
+  const firstPage = await getLeaguePage(1, pageSize);
+
+  const total = Number(firstPage.total || 0);
+
+  if (!total) {
+    return null;
+  }
+
+  const lastPage = Math.ceil(total / pageSize);
+
+  /*
+    We first use binary search to find approximately
+    where the league belongs based on its points.
+  */
+
+  let low = 1;
+  let high = lastPage;
+
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+
+    const page = await getLeaguePage(middle, pageSize);
+
+    const leagues = Array.isArray(page.leagues)
+      ? page.leagues
+      : [];
+
+    if (!leagues.length) {
+      high = middle;
+      continue;
+    }
+
+    const lastPoints = Number(
+      leagues[leagues.length - 1].Points || 0
+    );
+
+    if (lastPoints > targetPoints) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  /*
+    Check several pages around the estimated location.
+  */
+
+  const pagesToCheck = new Set();
+
+  for (let offset = -3; offset <= 3; offset++) {
+    const pageNumber = low + offset;
+
+    if (
+      pageNumber >= 1 &&
+      pageNumber <= lastPage
+    ) {
+      pagesToCheck.add(pageNumber);
+    }
+  }
+
+  for (const pageNumber of [...pagesToCheck].sort(
+    (a, b) => a - b
+  )) {
+    const page =
+      pageNumber === 1
+        ? firstPage
+        : await getLeaguePage(pageNumber, pageSize);
+
+    const leagues = Array.isArray(page.leagues)
+      ? page.leagues
+      : [];
+
+    for (let i = 0; i < leagues.length; i++) {
+      const league = leagues[i];
+
+      const sameName =
+        String(league.Name || "").toLowerCase() ===
+        String(targetLeague.Name || LEAGUE_NAME).toLowerCase();
+
+      const sameId =
+        targetLeague.ID &&
+        league.ID &&
+        String(targetLeague.ID) === String(league.ID);
+
+      if (sameId || sameName) {
+        return (
+          (pageNumber - 1) * pageSize +
+          i +
+          1
+        );
+      }
+    }
+  }
+
+  /*
+    Very safe fallback.
+
+    This only happens if equal point totals caused the
+    binary-search window to miss the league.
+  */
+
+  console.log(
+    "Rank not found in estimated pages. Starting full scan..."
   );
+
+  for (
+    let pageNumber = 1;
+    pageNumber <= lastPage;
+    pageNumber++
+  ) {
+    if (pagesToCheck.has(pageNumber)) {
+      continue;
+    }
+
+    const page =
+      pageNumber === 1
+        ? firstPage
+        : await getLeaguePage(pageNumber, pageSize);
+
+    const leagues = Array.isArray(page.leagues)
+      ? page.leagues
+      : [];
+
+    for (let i = 0; i < leagues.length; i++) {
+      const league = leagues[i];
+
+      const sameId =
+        targetLeague.ID &&
+        league.ID &&
+        String(targetLeague.ID) === String(league.ID);
+
+      const sameName =
+        String(league.Name || "").toLowerCase() ===
+        String(targetLeague.Name || LEAGUE_NAME).toLowerCase();
+
+      if (sameId || sameName) {
+        return (
+          (pageNumber - 1) * pageSize +
+          i +
+          1
+        );
+      }
+    }
+  }
+
+  return null;
 }
 
 /* =========================================================
    STATE
 ========================================================= */
 
-function loadState() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return {
-      leagueName: LEAGUE_NAME,
-      snapshots: [],
-      previousRank: null,
-      dashboardMessageId: null,
-    };
-  }
-
+function readState() {
   try {
-    const state = JSON.parse(
-      fs.readFileSync(
-        STATE_FILE,
-        "utf8"
-      )
+    if (!fs.existsSync(STATE_FILE)) {
+      return {
+        snapshots: [],
+        lastRank: null,
+      };
+    }
+
+    const raw = fs.readFileSync(
+      STATE_FILE,
+      "utf8"
     );
 
+    const parsed = JSON.parse(raw);
+
     return {
-      leagueName: LEAGUE_NAME,
+      snapshots: Array.isArray(parsed.snapshots)
+        ? parsed.snapshots
+        : [],
 
-      snapshots:
-        Array.isArray(state.snapshots)
-          ? state.snapshots
-          : [],
-
-      previousRank:
-        Number.isFinite(
-          state.previousRank
-        )
-          ? state.previousRank
-          : null,
-
-      dashboardMessageId:
-        typeof state.dashboardMessageId ===
-        "string"
-          ? state.dashboardMessageId
+      lastRank:
+        Number.isFinite(Number(parsed.lastRank))
+          ? Number(parsed.lastRank)
           : null,
     };
-  } catch {
+  } catch (error) {
     console.warn(
-      "state.json is invalid. Starting fresh."
+      "Could not read state.json. Creating a new state."
     );
 
     return {
-      leagueName: LEAGUE_NAME,
       snapshots: [],
-      previousRank: null,
-      dashboardMessageId: null,
+      lastRank: null,
     };
   }
 }
 
-function saveState(state) {
+function writeState(state) {
+  const temporaryFile =
+    `${STATE_FILE}.tmp`;
+
   fs.writeFileSync(
-    STATE_FILE,
-    JSON.stringify(
-      state,
-      null,
-      2
-    ),
+    temporaryFile,
+    JSON.stringify(state, null, 2),
     "utf8"
+  );
+
+  fs.renameSync(
+    temporaryFile,
+    STATE_FILE
   );
 }
 
 /* =========================================================
-   FORMAT
+   ROSTER
 ========================================================= */
 
-function formatPoints(value) {
-  if (!Number.isFinite(value)) {
-    return "0";
-  }
-
-  const abs = Math.abs(value);
-
-  if (abs >= 1_000_000_000) {
-    return `${(
-      value / 1_000_000_000
-    ).toFixed(2)}b`;
-  }
-
-  if (abs >= 1_000_000) {
-    return `${(
-      value / 1_000_000
-    ).toFixed(2)}m`;
-  }
-
-  if (abs >= 1_000) {
-    return `${(
-      value / 1_000
-    ).toFixed(2)}k`;
-  }
-
-  return Math.round(
-    value
-  ).toLocaleString("en-US");
+function normalizeId(value) {
+  return String(value ?? "");
 }
 
-function formatFullPoints(value) {
-  return Math.round(
-    value || 0
-  ).toLocaleString("en-US");
-}
+function getRoster(league) {
+  const roster = [];
 
-function formatDelta(value) {
+  /*
+    Owner
+  */
+
   if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(value)
+    league.Owner &&
+    league.Owner.UserID != null
   ) {
-    return "—";
+    roster.push({
+      UserID: league.Owner.UserID,
+      DisplayName: league.Owner.DisplayName,
+    });
   }
 
-  if (value === 0) {
-    return "0";
+  /*
+    Members
+  */
+
+  if (Array.isArray(league.Members)) {
+    for (const member of league.Members) {
+      if (
+        member &&
+        member.UserID != null
+      ) {
+        roster.push({
+          UserID: member.UserID,
+          DisplayName: member.DisplayName,
+        });
+      }
+    }
   }
 
-  return `${
-    value > 0 ? "+" : ""
-  }${formatPoints(value)}`;
+  /*
+    Remove duplicate IDs.
+  */
+
+  const seen = new Set();
+
+  return roster.filter((player) => {
+    const id = normalizeId(player.UserID);
+
+    if (!id) {
+      return false;
+    }
+
+    if (seen.has(id)) {
+      return false;
+    }
+
+    seen.add(id);
+
+    return true;
+  });
 }
+
+/* =========================================================
+   CONTRIBUTIONS
+========================================================= */
+
+function getContributors(league) {
+  const contributions =
+    Array.isArray(league.PointContributions)
+      ? league.PointContributions
+      : [];
+
+  const map = new Map();
+
+  for (const entry of contributions) {
+    if (
+      !entry ||
+      entry.UserID == null
+    ) {
+      continue;
+    }
+
+    map.set(
+      normalizeId(entry.UserID),
+      entry
+    );
+  }
+
+  return map;
+}
+
+/* =========================================================
+   BUILD PLAYER DATA
+========================================================= */
+
+function buildPlayers(league) {
+  const roster = getRoster(league);
+  const contributions = getContributors(league);
+
+  return roster.map((member) => {
+    const id = normalizeId(member.UserID);
+
+    const contribution =
+      contributions.get(id);
+
+    /*
+      IMPORTANT:
+
+      PointContributions.DisplayName is preferred.
+
+      If for some reason it is missing,
+      use Members/Owner DisplayName.
+
+      Only if both are missing do we show the ID.
+    */
+
+    const displayName =
+      contribution?.DisplayName ||
+      member.DisplayName ||
+      id;
+
+    return {
+      userId: id,
+
+      displayName,
+
+      points: Number(
+        contribution?.Points || 0
+      ),
+
+      timestamp:
+        contribution?.Timestamp == null
+          ? null
+          : Number(
+              contribution.Timestamp
+            ),
+    };
+  });
+}
+
+/* =========================================================
+   NUMBER FORMATTING
+========================================================= */
+
+function formatNumber(value) {
+  return new Intl.NumberFormat(
+    "en-US"
+  ).format(
+    Math.round(
+      Number(value) || 0
+    )
+  );
+}
+
+function formatCompact(value) {
+  const number =
+    Number(value) || 0;
+
+  if (Math.abs(number) >= 1e9) {
+    return (
+      number / 1e9
+    ).toFixed(2) + "b";
+  }
+
+  if (Math.abs(number) >= 1e6) {
+    return (
+      number / 1e6
+    ).toFixed(2) + "m";
+  }
+
+  if (Math.abs(number) >= 1e3) {
+    return (
+      number / 1e3
+    ).toFixed(2) + "k";
+  }
+
+  return formatNumber(number);
+}
+
+/* =========================================================
+   SVG HELPERS
+========================================================= */
 
 function escapeXml(value) {
   return String(value ?? "")
@@ -180,1018 +522,28 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
-function clamp(
-  value,
-  min,
-  max
-) {
-  return Math.max(
-    min,
-    Math.min(max, value)
-  );
-}
-
-/* =========================================================
-   HTTP GET
-========================================================= */
-
-function getJson(url) {
-  return new Promise(
-    (resolve, reject) => {
-      const request =
-        https.get(
-          url,
-          {
-            headers: {
-              Accept:
-                "application/json",
-              "User-Agent":
-                "MGKK-Discord-Bot/3.0",
-            },
-          },
-          (response) => {
-            let body = "";
-
-            response.setEncoding(
-              "utf8"
-            );
-
-            response.on(
-              "data",
-              (chunk) => {
-                body += chunk;
-              }
-            );
-
-            response.on(
-              "end",
-              () => {
-                let parsed;
-
-                try {
-                  parsed =
-                    JSON.parse(body);
-                } catch {
-                  reject(
-                    new Error(
-                      `Invalid JSON from API (${response.statusCode}).`
-                    )
-                  );
-                  return;
-                }
-
-                if (
-                  response.statusCode <
-                    200 ||
-                  response.statusCode >=
-                    300
-                ) {
-                  reject(
-                    new Error(
-                      parsed?.error
-                        ?.message ||
-                        `HTTP ${response.statusCode}`
-                    )
-                  );
-                  return;
-                }
-
-                if (
-                  parsed?.status ===
-                  "error"
-                ) {
-                  reject(
-                    new Error(
-                      parsed?.error
-                        ?.message ||
-                        "API returned an error."
-                    )
-                  );
-                  return;
-                }
-
-                resolve(parsed);
-              }
-            );
-          }
-        );
-
-      request.setTimeout(
-        20000,
-        () => {
-          request.destroy(
-            new Error(
-              "Request timed out."
-            )
-          );
-        }
-      );
-
-      request.on(
-        "error",
-        reject
-      );
-    }
-  );
-}
-
-/* =========================================================
-   HTTP POST
-   Needed for Roblox Users API
-========================================================= */
-
-function postJson(
-  url,
-  data
-) {
-  return new Promise(
-    (resolve, reject) => {
-      const body =
-        JSON.stringify(data);
-
-      const request =
-        https.request(
-          url,
-          {
-            method: "POST",
-
-            headers: {
-              Accept:
-                "application/json",
-
-              "Content-Type":
-                "application/json",
-
-              "Content-Length":
-                Buffer.byteLength(
-                  body
-                ),
-
-              "User-Agent":
-                "MGKK-Discord-Bot/3.0",
-            },
-          },
-          (response) => {
-            let responseBody =
-              "";
-
-            response.setEncoding(
-              "utf8"
-            );
-
-            response.on(
-              "data",
-              (chunk) => {
-                responseBody +=
-                  chunk;
-              }
-            );
-
-            response.on(
-              "end",
-              () => {
-                let parsed;
-
-                try {
-                  parsed =
-                    JSON.parse(
-                      responseBody
-                    );
-                } catch {
-                  reject(
-                    new Error(
-                      `Invalid JSON from POST API (${response.statusCode}).`
-                    )
-                  );
-                  return;
-                }
-
-                if (
-                  response.statusCode <
-                    200 ||
-                  response.statusCode >=
-                    300
-                ) {
-                  reject(
-                    new Error(
-                      parsed?.errors?.[0]
-                        ?.message ||
-                        parsed?.message ||
-                        `HTTP ${response.statusCode}`
-                    )
-                  );
-                  return;
-                }
-
-                resolve(
-                  parsed
-                );
-              }
-            );
-          }
-        );
-
-      request.setTimeout(
-        20000,
-        () => {
-          request.destroy(
-            new Error(
-              "POST request timed out."
-            )
-          );
-        }
-      );
-
-      request.on(
-        "error",
-        reject
-      );
-
-      request.write(body);
-      request.end();
-    }
-  );
-}
-
-/* =========================================================
-   GET LEAGUE
-========================================================= */
-
-async function getLeague() {
-  const url =
-    `${API_BASE}/leagues/` +
-    encodeURIComponent(
-      LEAGUE_NAME
-    );
-
-  const response =
-    await getJson(url);
-
-  if (!response?.data) {
-    throw new Error(
-      "League API returned no data."
-    );
-  }
-
-  return response.data;
-}
-
-/* =========================================================
-   LEAGUE RANK
-========================================================= */
-
-async function getLeagueRank(
-  previousRank
-) {
-  const PAGE_SIZE = 100;
-
-  let center = 1;
-
-  if (
-    Number.isFinite(
-      previousRank
-    ) &&
-    previousRank > 0
-  ) {
-    center =
-      Math.floor(
-        (previousRank - 1) /
-          PAGE_SIZE
-      ) + 1;
-  }
-
-  const checked =
-    new Set();
-
-  async function checkPage(
-    page
-  ) {
-    if (checked.has(page)) {
-      return null;
-    }
-
-    checked.add(page);
-
-    const url =
-      `${API_BASE}/leagues` +
-      `?page=${page}` +
-      `&pageSize=${PAGE_SIZE}` +
-      `&sort=Points` +
-      `&sortOrder=desc`;
-
-    try {
-      const response =
-        await getJson(url);
-
-      const leagues =
-        response?.data
-          ?.leagues || [];
-
-      for (
-        let i = 0;
-        i < leagues.length;
-        i++
-      ) {
-        const league =
-          leagues[i];
-
-        if (
-          String(
-            league?.Name
-          ).toLowerCase() ===
-          LEAGUE_NAME.toLowerCase()
-        ) {
-          return (
-            (page - 1) *
-              PAGE_SIZE +
-            i +
-            1
-          );
-        }
-      }
-    } catch (error) {
-      console.warn(
-        `Leaderboard page ${page} failed:`,
-        error.message
-      );
-    }
-
-    return null;
-  }
-
-  let rank =
-    await checkPage(center);
-
-  if (rank) {
-    return rank;
-  }
-
-  for (
-    let distance = 1;
-    distance <= 10;
-    distance++
-  ) {
-    const pages = [
-      center - distance,
-      center + distance,
-    ].filter(
-      (page) => page >= 1
-    );
-
-    for (
-      const page of pages
-    ) {
-      rank =
-        await checkPage(
-          page
-        );
-
-      if (rank) {
-        return rank;
-      }
-    }
-  }
-
-  /*
-    First run: inspect first 20 pages.
-  */
-
-  if (
-    !Number.isFinite(
-      previousRank
-    )
-  ) {
-    for (
-      let page = 1;
-      page <= 20;
-      page++
-    ) {
-      rank =
-        await checkPage(
-          page
-        );
-
-      if (rank) {
-        return rank;
-      }
-    }
-  }
-
-  /*
-    Expanded search.
-  */
-
-  const expansion = [
-    25,
-    50,
-    75,
-    100,
-    150,
-    200,
-    300,
-    400,
-    500,
-    700,
-    900,
-  ];
-
-  for (
-    const page of expansion
-  ) {
-    rank =
-      await checkPage(
-        page
-      );
-
-    if (rank) {
-      return rank;
-    }
-  }
-
-  return null;
-}
-
-/* =========================================================
-   ROSTER
-========================================================= */
-
-function buildRoster(
-  league
-) {
-  const roster = [];
-
-  /*
-    OWNER
-  */
-
-  if (
-    league.Owner?.UserID !=
-    null
-  ) {
-    roster.push({
-      userId: String(
-        league.Owner.UserID
-      ),
-
-      displayName:
-        league.Owner.DisplayName ||
-        String(
-          league.Owner.UserID
-        ),
-    });
-  }
-
-  /*
-    MEMBERS
-  */
-
-  if (
-    Array.isArray(
-      league.Members
-    )
-  ) {
-    for (
-      const member of league.Members
-    ) {
-      if (
-        member?.UserID ==
-        null
-      ) {
-        continue;
-      }
-
-      const userId =
-        String(
-          member.UserID
-        );
-
-      if (
-        roster.some(
-          (player) =>
-            player.userId ===
-            userId
-        )
-      ) {
-        continue;
-      }
-
-      roster.push({
-        userId,
-
-        displayName:
-          member.DisplayName ||
-          String(userId),
-      });
-    }
-  }
-
-  return roster.slice(
-    0,
-    4
-  );
-}
-
-/* =========================================================
-   POINT CONTRIBUTIONS
-========================================================= */
-
-function buildContributionMap(
-  league
-) {
-  const map =
-    new Map();
-
-  if (
-    !Array.isArray(
-      league.PointContributions
-    )
-  ) {
-    return map;
-  }
-
-  for (
-    const entry of
-      league.PointContributions
-  ) {
-    if (
-      entry?.UserID ==
-      null
-    ) {
-      continue;
-    }
-
-    map.set(
-      String(entry.UserID),
-      {
-        userId: String(
-          entry.UserID
-        ),
-
-        displayName:
-          entry.DisplayName ||
-          null,
-
-        points:
-          Number(
-            entry.Points
-          ) || 0,
-
-        timestamp:
-          Number.isFinite(
-            Number(
-              entry.Timestamp
-            )
-          )
-            ? Number(
-                entry.Timestamp
-              )
-            : null,
-      }
-    );
-  }
-
-  return map;
-}
-
-function buildPlayers(
-  league
-) {
-  const roster =
-    buildRoster(
-      league
-    );
-
-  const contributionMap =
-    buildContributionMap(
-      league
-    );
-
-  return roster.map(
-    (member) => {
-      const contribution =
-        contributionMap.get(
-          member.userId
-        );
-
-      return {
-        userId:
-          member.userId,
-
-        /*
-          IMPORTANT:
-          Roblox DisplayName is filled later
-          using the official Roblox Users API.
-        */
-
-        displayName:
-          contribution?.displayName ||
-          member.displayName ||
-          member.userId,
-
-        points:
-          contribution?.points ||
-          0,
-
-        timestamp:
-          contribution?.timestamp ||
-          null,
-      };
-    }
-  );
-}
-
-/* =========================================================
-   ROBLOX DISPLAY NAMES
-========================================================= */
-
-async function getRobloxUserInfo(
-  userIds
-) {
-  const result =
-    new Map();
-
-  if (!userIds.length) {
-    return result;
-  }
-
-  try {
-    /*
-      Roblox Users API requires POST.
-    */
-
-    const response =
-      await postJson(
-        "https://users.roblox.com/v1/users",
-        {
-          userIds:
-            userIds.map(
-              (id) =>
-                Number(id)
-            ),
-
-          excludeBannedUsers:
-            false,
-        }
-      );
-
-    for (
-      const user of
-        response?.data || []
-    ) {
-      if (
-        user?.id == null
-      ) {
-        continue;
-      }
-
-      result.set(
-        String(user.id),
-        {
-          /*
-            This is the actual Roblox
-            DisplayName.
-          */
-
-          displayName:
-            user.displayName ||
-            user.name ||
-            String(user.id),
-
-          /*
-            This is the Roblox username
-            (@username).
-          */
-
-          username:
-            user.name ||
-            user.displayName ||
-            String(user.id),
-        }
-      );
-    }
-  } catch (error) {
-    console.warn(
-      "Could not load Roblox DisplayNames:",
-      error.message
-    );
-  }
-
-  return result;
-}
-
-/* =========================================================
-   ROBLOX AVATARS
-========================================================= */
-
-async function getAvatarUrl(
-  userIds
-) {
-  const result =
-    new Map();
-
-  if (!userIds.length) {
-    return result;
-  }
-
-  try {
-    const url =
-      "https://thumbnails.roblox.com/v1/users/avatar-headshot" +
-      `?userIds=${userIds.join(",")}` +
-      "&size=150x150" +
-      "&format=Png" +
-      "&isCircular=true";
-
-    const response =
-      await getJson(url);
-
-    for (
-      const item of
-        response?.data || []
-    ) {
-      if (
-        item?.targetId !=
-          null &&
-        item?.imageUrl
-      ) {
-        result.set(
-          String(
-            item.targetId
-          ),
-          item.imageUrl
-        );
-      }
-    }
-  } catch (error) {
-    console.warn(
-      "Could not load Roblox avatars:",
-      error.message
-    );
-  }
-
-  return result;
-}
-
-function downloadBuffer(
-  url
-) {
-  return new Promise(
-    (resolve, reject) => {
-      https
-        .get(
-          url,
-          {
-            headers: {
-              "User-Agent":
-                "MGKK-Discord-Bot/3.0",
-            },
-          },
-          (response) => {
-            /*
-              Redirect
-            */
-
-            if (
-              response.statusCode >=
-                300 &&
-              response.statusCode <
-                400 &&
-              response.headers
-                .location
-            ) {
-              downloadBuffer(
-                response.headers
-                  .location
-              )
-                .then(resolve)
-                .catch(reject);
-
-              return;
-            }
-
-            if (
-              response.statusCode !==
-              200
-            ) {
-              reject(
-                new Error(
-                  `Avatar HTTP ${response.statusCode}`
-                )
-              );
-
-              return;
-            }
-
-            const chunks =
-              [];
-
-            response.on(
-              "data",
-              (chunk) => {
-                chunks.push(
-                  chunk
-                );
-              }
-            );
-
-            response.on(
-              "end",
-              () => {
-                resolve(
-                  Buffer.concat(
-                    chunks
-                  )
-                );
-              }
-            );
-          }
-        )
-        .on(
-          "error",
-          reject
-        );
-    }
-  );
-}
-
-/* =========================================================
-   HISTORY
-========================================================= */
-
-function addSnapshot(
-  state,
-  players,
-  timestamp
-) {
-  const playerPoints =
-    {};
-
-  for (
-    const player of players
-  ) {
-    playerPoints[
-      player.userId
-    ] =
-      Number(
-        player.points
-      ) || 0;
-  }
-
-  state.snapshots.push({
-    timestamp,
-    players:
-      playerPoints,
-  });
-
-  const cutoff =
-    timestamp -
-    HISTORY_RETENTION;
-
-  state.snapshots =
-    state.snapshots.filter(
-      (snapshot) =>
-        Number(
-          snapshot.timestamp
-        ) >= cutoff
-    );
-
-  /*
-    Don't store duplicate snapshots
-    less than one minute apart.
-  */
-
-  const cleaned =
-    [];
-
-  for (
-    const snapshot of
-      state.snapshots
-  ) {
-    const last =
-      cleaned[
-        cleaned.length - 1
-      ];
-
-    if (
-      !last ||
-      Math.abs(
-        Number(
-          snapshot.timestamp
-        ) -
-          Number(
-            last.timestamp
-          )
-      ) >= 60_000
-    ) {
-      cleaned.push(
-        snapshot
-      );
-    }
-  }
-
-  state.snapshots =
-    cleaned;
-}
-
-function getPointsAtOrBefore(
-  state,
-  userId,
-  targetTimestamp
-) {
-  let best = null;
-
-  for (
-    const snapshot of
-      state.snapshots
-  ) {
-    if (
-      Number(
-        snapshot.timestamp
-      ) <= targetTimestamp
-    ) {
-      if (
-        !best ||
-        Number(
-          snapshot.timestamp
-        ) >
-          Number(
-            best.timestamp
-          )
-      ) {
-        best =
-          snapshot;
-      }
-    }
-  }
-
-  if (!best) {
-    return null;
-  }
-
-  const points =
-    best.players?.[
-      userId
-    ];
-
-  if (
-    !Number.isFinite(
-      Number(points)
-    )
-  ) {
-    return null;
-  }
-
-  return Number(
-    points
-  );
-}
-
-function getDelta(
-  state,
-  userId,
-  currentPoints,
-  millisecondsAgo
-) {
-  const target =
-    Date.now() -
-    millisecondsAgo;
-
-  const oldPoints =
-    getPointsAtOrBefore(
-      state,
-      userId,
-      target
-    );
-
-  if (
-    oldPoints === null
-  ) {
-    return null;
+function truncate(value, max = 22) {
+  const text = String(value ?? "");
+
+  if (text.length <= max) {
+    return text;
   }
 
   return (
-    currentPoints -
-    oldPoints
+    text.slice(0, max - 1) +
+    "…"
   );
 }
 
-/* =========================================================
-   SVG TEXT
-========================================================= */
-
-function makeText(
+function svgText(
+  text,
   x,
   y,
-  text,
-  options = {}
+  size,
+  weight = 400,
+  fill = "#F4F7FB",
+  anchor = "start"
 ) {
-  const {
-    size = 24,
-    weight = 400,
-    fill = "#ffffff",
-    anchor = "start",
-    opacity = 1,
-  } = options;
-
   return `
     <text
       x="${x}"
@@ -1201,12 +553,11 @@ function makeText(
       font-weight="${weight}"
       fill="${fill}"
       text-anchor="${anchor}"
-      opacity="${opacity}"
     >${escapeXml(text)}</text>
   `;
 }
 
-function makeRoundedRect(
+function roundedRect(
   x,
   y,
   width,
@@ -1228,3252 +579,1067 @@ function makeRoundedRect(
       stroke-width="${strokeWidth}"
     />
   `;
-}
-
-/* =========================================================
-   DASHBOARD SVG
-========================================================= */
-
-const PLAYER_COLORS = [
-  "#19c7ff",
-  "#ff3ca6",
-  "#ffab19",
-  "#35e0b2",
-];
-
-function makeDashboardSvg({
-  league,
-  rank,
-  players,
-  state,
-  avatarBuffers,
-}) {
-  const width =
-    1600;
-
-  const height =
-    1080;
-
-  const bg =
-    "#17191d";
-
-  const panel =
-    "#20242a";
-
-  const border =
-    "#30363e";
-
-  const muted =
-    "#8f98a5";
-
-  const white =
-    "#f4f6f8";
-
-  let svg = `
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    width="${width}"
-    height="${height}"
-    viewBox="0 0 ${width} ${height}"
-  >
-
-    <defs>
-
-      <linearGradient
-        id="headerGradient"
-        x1="0"
-        y1="0"
-        x2="1"
-        y2="1"
-      >
-        <stop
-          offset="0%"
-          stop-color="#202a35"
-        />
-
-        <stop
-          offset="100%"
-          stop-color="#171a1f"
-        />
-      </linearGradient>
-
-    </defs>
-
-    ${makeRoundedRect(
-      0,
-      0,
-      width,
-      height,
-      34,
-      bg
-    )}
-
-    ${makeRoundedRect(
-      36,
-      30,
-      width - 72,
-      145,
-      24,
-      "url(#headerGradient)",
-      border,
-      2
-    )}
-
-    ${makeText(
-      75,
-      82,
-      `⭐ ${
-        league.Name ||
-        LEAGUE_NAME
-      }`,
-      {
-        size: 42,
-        weight: 800,
-        fill: white,
-      }
-    )}
-
-    ${makeText(
-      75,
-      125,
-      "League dashboard",
-      {
-        size: 22,
-        weight: 500,
-        fill: muted,
-      }
-    )}
-
-    ${makeText(
-      width - 75,
-      80,
-      rank
-        ? `#${rank}`
-        : "#—",
-      {
-        size: 42,
-        weight: 800,
-        fill: "#ffd35a",
-        anchor: "end",
-      }
-    )}
-
-    ${makeText(
-      width - 75,
-      122,
-      "GLOBAL RANK",
-      {
-        size: 18,
-        weight: 700,
-        fill: muted,
-        anchor: "end",
-      }
-    )}
-
-    ${makeRoundedRect(
-      36,
-      200,
-      width - 72,
-      135,
-      24,
-      panel,
-      border,
-      2
-    )}
-
-    ${makeText(
-      75,
-      250,
-      "TOTAL LEAGUE POINTS",
-      {
-        size: 18,
-        weight: 700,
-        fill: muted,
-      }
-    )}
-
-    ${makeText(
-      75,
-      305,
-      formatFullPoints(
-        Number(
-          league.Points
-        ) || 0
-      ),
-      {
-        size: 46,
-        weight: 800,
-        fill: white,
-      }
-    )}
-
-    ${makeText(
-      width - 75,
-      255,
-      `${players.length}/4 MEMBERS`,
-      {
-        size: 20,
-        weight: 700,
-        fill: "#55d7ff",
-        anchor: "end",
-      }
-    )}
-
-    ${makeText(
-      width - 75,
-      302,
-      "Live API data",
-      {
-        size: 18,
-        weight: 500,
-        fill: muted,
-        anchor: "end",
-      }
-    )}
-
-    ${makeText(
-      55,
-      395,
-      "PLAYER CONTRIBUTIONS",
-      {
-        size: 20,
-        weight: 800,
-        fill: white,
-      }
-    )}
-
-    ${makeRoundedRect(
-      36,
-      420,
-      width - 72,
-      300,
-      24,
-      panel,
-      border,
-      2
-    )}
-  `;
-
-  /*
-    Table headers
-  */
-
-  svg += makeText(
-    170,
-    460,
-    "PLAYER",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-    }
-  );
-
-  svg += makeText(
-    700,
-    460,
-    "CONTRIBUTED",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    880,
-    460,
-    "+1H",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    1050,
-    460,
-    "+24H",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    1230,
-    460,
-    "SHARE",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    1515,
-    460,
-    "UPDATED",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  const totalPoints =
-    players.reduce(
-      (sum, player) =>
-        sum +
-        Number(
-          player.points || 0
-        ),
-      0
-    );
-
-  const rowHeight =
-    62;
-
-  players.forEach(
-    (player, index) => {
-      const y =
-        480 +
-        index *
-          rowHeight;
-
-      const color =
-        PLAYER_COLORS[
-          index
-        ];
-
-      if (index > 0) {
-        svg += `
-          <line
-            x1="70"
-            y1="${y - 5}"
-            x2="${
-              width - 70
-            }"
-            y2="${y - 5}"
-            stroke="${border}"
-            stroke-width="1"
-          />
-        `;
-      }
-
-      svg += `
-        <rect
-          x="52"
-          y="${y + 8}"
-          width="6"
-          height="42"
-          rx="3"
-          fill="${color}"
-        />
-      `;
-
-      /*
-        Avatar
-      */
-
-      const avatar =
-        avatarBuffers.get(
-          player.userId
-        );
-
-      if (avatar) {
-        const avatarData =
-          avatar.toString(
-            "base64"
-          );
-
-        svg += `
-          <defs>
-            <clipPath
-              id="avatar-${index}"
-            >
-              <circle
-                cx="105"
-                cy="${y + 29}"
-                r="23"
-              />
-            </clipPath>
-          </defs>
-
-          <circle
-            cx="105"
-            cy="${y + 29}"
-            r="25"
-            fill="#343a43"
-          />
-
-          <image
-            href="data:image/png;base64,${avatarData}"
-            x="80"
-            y="${y + 4}"
-            width="50"
-            height="50"
-            preserveAspectRatio="xMidYMid slice"
-            clip-path="url(#avatar-${index})"
-          />
-        `;
-      } else {
-        svg += `
-          <circle
-            cx="105"
-            cy="${y + 29}"
-            r="25"
-            fill="#343a43"
-          />
-        `;
-      }
-
-      /*
-        REAL ROBLOX DISPLAY NAME
-      */
-
-      const name =
-        String(
-          player.displayName ||
-          player.userId
-        );
-
-      const points =
-        Number(
-          player.points
-        ) || 0;
-
-      const delta1h =
-        getDelta(
-          state,
-          player.userId,
-          points,
-          60 *
-            60 *
-            1000
-        );
-
-      const delta24h =
-        getDelta(
-          state,
-          player.userId,
-          points,
-          24 *
-            60 *
-            60 *
-            1000
-        );
-
-      const share =
-        totalPoints > 0
-          ? (points /
-              totalPoints) *
-            100
-          : 0;
-
-      let updated =
-        "—";
-
-      if (
-        player.timestamp
-      ) {
-        updated =
-          new Date(
-            player.timestamp *
-              1000
-          ).toLocaleTimeString(
-            "en-US",
-            {
-              hour: "2-digit",
-              minute:
-                "2-digit",
-            }
-          );
-      }
-
-      /*
-        DisplayName
-      */
-
-      svg += makeText(
-        170,
-        y + 28,
-        name.length > 22
-          ? `${name.slice(
-              0,
-              21
-            )}…`
-          : name,
-        {
-          size: 22,
-          weight: 700,
-          fill: white,
-        }
-      );
-
-      /*
-        UserID stays smaller underneath
-      */
-
-      svg += makeText(
-        170,
-        y + 48,
-        `ID ${player.userId}`,
-        {
-          size: 13,
-          weight: 500,
-          fill: muted,
-        }
-      );
-
-      svg += makeText(
-        700,
-        y + 37,
-        formatPoints(
-          points
-        ),
-        {
-          size: 23,
-          weight: 800,
-          fill: color,
-          anchor: "end",
-        }
-      );
-
-      svg += makeText(
-        880,
-        y + 37,
-        formatDelta(
-          delta1h
-        ),
-        {
-          size: 20,
-          weight: 700,
-          fill:
-            delta1h ===
-            null
-              ? muted
-              : white,
-          anchor: "end",
-        }
-      );
-
-      svg += makeText(
-        1050,
-        y + 37,
-        formatDelta(
-          delta24h
-        ),
-        {
-          size: 20,
-          weight: 700,
-          fill:
-            delta24h ===
-            null
-              ? muted
-              : white,
-          anchor: "end",
-        }
-      );
-
-      svg += makeText(
-        1230,
-        y + 37,
-        `${share.toFixed(
-          1
-        )}%`,
-        {
-          size: 20,
-          weight: 700,
-          fill: color,
-          anchor: "end",
-        }
-      );
-
-      svg += makeText(
-        1515,
-        y + 37,
-        updated,
-        {
-          size: 18,
-          weight: 600,
-          fill: muted,
-          anchor: "end",
-        }
-      );
-    }
-  );
-
-  /* =======================================================
-     CHART
-  ======================================================= */
-
-  const chartX =
-    36;
-
-  const chartY =
-    755;
-
-  const chartW =
-    width - 72;
-
-  const chartH =
-    270;
-
-  svg += makeText(
-    55,
-    745,
-    "CONTRIBUTION HISTORY — LAST 24H",
-    {
-      size: 20,
-      weight: 800,
-      fill: white,
-    }
-  );
-
-  svg += makeRoundedRect(
-    chartX,
-    chartY,
-    chartW,
-    chartH,
-    24,
-    panel,
-    border,
-    2
-  );
-
-  const historyStart =
-    Date.now() -
-    24 *
-      60 *
-      60 *
-      1000;
-
-  const history =
-    state.snapshots.filter(
-      (snapshot) =>
-        Number(
-          snapshot.timestamp
-        ) >= historyStart
-    );
-
-  let maxValue = 1;
-
-  for (
-    const player of players
-  ) {
-    for (
-      const snapshot of
-        history
-    ) {
-      const value =
-        Number(
-          snapshot.players?.[
-            player.userId
-          ]
-        ) || 0;
-
-      maxValue =
-        Math.max(
-          maxValue,
-          value
-        );
-    }
-  }
-
-  const plotLeft =
-    chartX + 75;
-
-  const plotRight =
-    chartX +
-    chartW -
-    30;
-
-  const plotTop =
-    chartY + 25;
-
-  const plotBottom =
-    chartY +
-    chartH -
-    45;
-
-  const plotW =
-    plotRight -
-    plotLeft;
-
-  const plotH =
-    plotBottom -
-    plotTop;
-
-  /*
-    Grid
-  */
-
-  for (
-    let i = 0;
-    i <= 4;
-    i++
-  ) {
-    const y =
-      plotTop +
-      (plotH / 4) *
-        i;
-
-    svg += `
-      <line
-        x1="${plotLeft}"
-        y1="${y}"
-        x2="${plotRight}"
-        y2="${y}"
-        stroke="#30363e"
-        stroke-width="1"
-      />
-    `;
-
-    const value =
-      maxValue -
-      (maxValue / 4) *
-        i;
-
-    svg += makeText(
-      plotLeft - 12,
-      y + 6,
-      formatPoints(
-        value
-      ),
-      {
-        size: 14,
-        weight: 600,
-        fill: muted,
-        anchor: "end",
-      }
-    );
-  }
-
-  /*
-    X axis
-  */
-
-  const labels = [
-    {
-      x: plotLeft,
-      text: "24H",
-    },
-    {
-      x:
-        plotLeft +
-        plotW *
-          0.25,
-      text: "18H",
-    },
-    {
-      x:
-        plotLeft +
-        plotW *
-          0.5,
-      text: "12H",
-    },
-    {
-      x:
-        plotLeft +
-        plotW *
-          0.75,
-      text: "6H",
-    },
-    {
-      x: plotRight,
-      text: "NOW",
-    },
-  ];
-
-  for (
-    const label of labels
-  ) {
-    svg += makeText(
-      label.x,
-      chartY +
-        chartH -
-        15,
-      label.text,
-      {
-        size: 14,
-        weight: 700,
-        fill: muted,
-        anchor:
-          "middle",
-      }
-    );
-  }
-
-  /*
-    Player lines
-  */
-
-  players.forEach(
-    (player, index) => {
-      const color =
-        PLAYER_COLORS[
-          index
-        ];
-
-      const points =
-        [];
-
-      if (
-        history.length ===
-        0
-      ) {
-        points.push({
-          timestamp:
-            Date.now(),
-
-          value:
-            Number(
-              player.points
-            ) || 0,
-        });
-      } else {
-        for (
-          const snapshot of
-            history
-        ) {
-          const value =
-            Number(
-              snapshot
-                .players?.[
-                player.userId
-              ]
-            ) || 0;
-
-          points.push({
-            timestamp:
-              Number(
-                snapshot.timestamp
-              ),
-
-            value,
-          });
-        }
-
-        points.push({
-          timestamp:
-            Date.now(),
-
-          value:
-            Number(
-              player.points
-            ) || 0,
-        });
-      }
-
-      const linePoints =
-        points
-          .map(
-            (point) => {
-              const ratio =
-                clamp(
-                  (
-                    point.timestamp -
-                    historyStart
-                  ) /
-                    (
-                      24 *
-                      60 *
-                      60 *
-                      1000
-                    ),
-                  0,
-                  1
-                );
-
-              const x =
-                plotLeft +
-                ratio *
-                  plotW;
-
-              const y =
-                plotBottom -
-                (
-                  point.value /
-                  maxValue
-                ) *
-                  plotH;
-
-              return `${x.toFixed(
-                1
-              )},${y.toFixed(
-                1
-              )}`;
-            }
-          )
-          .join(" ");
-
-      svg += `
-        <polyline
-          points="${linePoints}"
-          fill="none"
-          stroke="${color}"
-          stroke-width="4"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
-      `;
-
-      /*
-        Current point
-      */
-
-      const currentValue =
-        Number(
-          player.points
-        ) || 0;
-
-      const currentY =
-        plotBottom -
-        (
-          currentValue /
-          maxValue
-        ) *
-          plotH;
-
-      svg += `
-        <circle
-          cx="${plotRight}"
-          cy="${currentY}"
-          r="6"
-          fill="${color}"
-        />
-      `;
-
-      /*
-        Legend
-      */
-
-      const legendX =
-        plotLeft +
-        index *
-          320;
-
-      svg += `
-        <circle
-          cx="${legendX}"
-          cy="${chartY + 22}"
-          r="5"
-          fill="${color}"
-        />
-      `;
-
-      svg += makeText(
-        legendX + 12,
-        chartY + 27,
-        player.displayName,
-        {
-          size: 15,
-          weight: 700,
-          fill: white,
-        }
-      );
-    }
-  );
-
-  svg += makeText(
-    width - 55,
-    height - 18,
-    "MGKK • BIG Games API",
-    {
-      size: 13,
-      weight: 600,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += `
-  </svg>
-  `;
-
-  return svg;
-}
-
-/* =========================================================
-   RENDER DASHBOARD
-========================================================= */
-
-async function renderDashboard({
-  league,
-  rank,
-  players,
-  state,
-}) {
-  const userIds =
-    players.map(
-      (player) =>
-        player.userId
-    );
-
-  /*
-    GET ACTUAL ROBLOX DISPLAY NAMES
-  */
-
-  const robloxUsers =
-    await getRobloxUserInfo(
-      userIds
-    );
-
-  /*
-    Replace UserID fallback with
-    the actual Roblox DisplayName.
-  */
-
-  for (
-    const player of players
-  ) {
-    const robloxUser =
-      robloxUsers.get(
-        player.userId
-      );
-
-    if (
-      robloxUser?.displayName
-    ) {
-      player.displayName =
-        robloxUser.displayName;
-    }
-  }
-
-  /*
-    GET ROBLOX AVATARS
-  */
-
-  const avatarUrls =
-    await getAvatarUrl(
-      userIds
-    );
-
-  const avatarBuffers =
-    new Map();
-
-  for (
-    const player of players
-  ) {
-    const url =
-      avatarUrls.get(
-        player.userId
-      );
-
-    if (!url) {
-      continue;
-    }
-
-    try {
-      const buffer =
-        await downloadBuffer(
-          url
-        );
-
-      avatarBuffers.set(
-        player.userId,
-        buffer
-      );
-    } catch (error) {
-      console.warn(
-        `Avatar failed for ${player.userId}:`,
-        error.message
-      );
-    }
-  }
-
-  const svg =
-    makeDashboardSvg({
-      league,
-      rank,
-      players,
-      state,
-      avatarBuffers,
-    });
-
-  return sharp(
-    Buffer.from(svg)
-  )
-    .png({
-      compressionLevel: 9,
-      quality: 100,
-    })
-    .toBuffer();
-}
-
-/* =========================================================
-   DISCORD CHANNEL
-========================================================= */
-
-async function getDiscordChannel(
-  client
-) {
-  const channel =
-    await client.channels.fetch(
-      DISCORD_CHANNEL_ID
-    );
-
-  if (!channel) {
-    throw new Error(
-      "Discord channel not found."
-    );
-  }
-
-  if (
-    !channel.isTextBased() ||
-    !channel.messages
-  ) {
-    throw new Error(
-      "DISCORD_CHANNEL_ID is not a text channel."
-    );
-  }
-
-  return channel;
-}
-
-/* =========================================================
-   UPDATE DASHBOARD MESSAGE
-========================================================= */
-
-async function updateDashboardMessage(
-  channel,
-  state,
-  pngBuffer
-) {
-  const attachment = {
-    attachment:
-      pngBuffer,
-
-    name:
-      "mgkk-dashboard.png",
-
-    description:
-      "MGKK League dashboard",
-  };
-
-  /*
-    Edit existing message.
-  */
-
-  if (
-    state.dashboardMessageId
-  ) {
-    try {
-      const message =
-        await channel.messages.fetch(
-          state.dashboardMessageId
-        );
-
-      await message.edit({
-        content: "",
-        embeds: [],
-        files: [
-          attachment,
-        ],
-      });
-
-      console.log(
-        `Dashboard updated: ${message.id}`
-      );
-
-      return message.id;
-    } catch (error) {
-      console.warn(
-        "Could not edit old dashboard message:",
-        error.message
-      );
-
-      state.dashboardMessageId =
-        null;
-    }
-  }
-
-  /*
-    Create dashboard once.
-  */
-
-  const message =
-    await channel.send({
-      content: "",
-      files: [
-        attachment,
-      ],
-    });
-
-  state.dashboardMessageId =
-    message.id;
-
-  console.log(
-    `Dashboard created: ${message.id}`
-  );
-
-  return message.id;
-}
-
-/* =========================================================
-   RANK NOTIFICATION
-========================================================= */
-
-async function sendRankNotification(
-  channel,
-  league,
-  previousRank,
-  currentRank
-) {
-  if (
-    !Number.isFinite(
-      previousRank
-    ) ||
-    !Number.isFinite(
-      currentRank
-    )
-  ) {
-    return;
-  }
-
-  if (
-    previousRank ===
-    currentRank
-  ) {
-    return;
-  }
-
-  const difference =
-    previousRank -
-    currentRank;
-
-  const improved =
-    difference > 0;
-
-  const embed =
-    new EmbedBuilder()
-      .setTitle(
-        improved
-          ? "📈 MGKK — Increased!"
-          : "📉 MGKK — Decreased"
-      )
-
-      .setDescription(
-        improved
-          ? `**${
-              league.Name
-            }** moved **${Math.abs(
-              difference
-            )} position${
-              Math.abs(
-                difference
-              ) === 1
-                ? ""
-                : "s"
-            } up** in the League leaderboard.`
-          : `**${
-              league.Name
-            }** moved **${Math.abs(
-              difference
-            )} position${
-              Math.abs(
-                difference
-              ) === 1
-                ? ""
-                : "s"
-            } down** in the League leaderboard.`
-      )
-
-      .addFields(
-        {
-          name:
-            "⬅️ Previous place",
-
-          value:
-            `#${previousRank}`,
-
-          inline: true,
-        },
-
-        {
-          name:
-            "🏆 Current place",
-
-          value:
-            `#${currentRank}`,
-
-          inline: true,
-        },
-
-        {
-          name:
-            "💎 Points",
-
-          value:
-            formatFullPoints(
-              Number(
-                league.Points
-              ) || 0
-            ),
-
-          inline: true,
-        }
-      )
-
-      .setFooter({
-        text:
-          "MGKK League • BIG Games API",
-      })
-
-      .setTimestamp();
-
-  await channel.send({
-    embeds: [
-      embed,
-    ],
-  });
-}
-
-/* =========================================================
-   MAIN
-========================================================= */
-
-async function main() {
-  const state =
-    loadState();
-
-  console.log(
-    `Checking ${LEAGUE_NAME}...`
-  );
-
-  /*
-    1. BIG Games API
-  */
-
-  const league =
-    await getLeague();
-
-  /*
-    2. Owner + Members
-  */
-
-  const players =
-    buildPlayers(
-      league
-    );
-
-  if (
-    players.length ===
-    0
-  ) {
-    throw new Error(
-      "No Owner/Members found."
-    );
-  }
-
-  console.log(
-    `League: ${league.Name}`
-  );
-
-  console.log(
-    `League points: ${formatFullPoints(
-      Number(
-        league.Points
-      ) || 0
-    )}`
-  );
-
-  /*
-    3. Roblox DisplayNames
-    are fetched during rendering.
-  */
-
-  console.log(
-    "Players from league API:"
-  );
-
-  for (
-    const player of players
-  ) {
-    console.log(
-      `- ${player.userId}: ${player.displayName}`
-    );
-  }
-
-  /*
-    4. Rank
-  */
-
-  const currentRank =
-    await getLeagueRank(
-      state.previousRank
-    );
-
-  console.log(
-    `Current rank: ${
-      currentRank ??
-      "unknown"
-    }`
-  );
-
-  /*
-    5. Snapshot
-  */
-
-  const now =
-    Date.now();
-
-  const lastSnapshot =
-    state.snapshots[
-      state.snapshots.length -
-        1
-    ];
-
-  if (
-    !lastSnapshot ||
-    now -
-      Number(
-        lastSnapshot.timestamp
-      ) >=
-      60_000
-  ) {
-    addSnapshot(
-      state,
-      players,
-      now
-    );
-  }
-
-  /*
-    6. Discord client
-  */
-
-  const client =
-    new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-      ],
-    });
-
-  await client.login(
-    DISCORD_TOKEN
-  );
-
-  try {
-    const channel =
-      await getDiscordChannel(
-        client
-      );
-
-    /*
-      Rank notification.
-    */
-
-    if (
-      currentRank !==
-        null &&
-      Number.isFinite(
-        currentRank
-      )
-    ) {
-      await sendRankNotification(
-        channel,
-        league,
-        state.previousRank,
-        currentRank
-      );
-
-      state.previousRank =
-        currentRank;
-    }
-
-    /*
-      7. Generate dashboard.
-    */
-
-    const pngBuffer =
-      await renderDashboard({
-        league,
-        rank: currentRank,
-        players,
-        state,
-      });
-
-    /*
-      8. Update same message.
-    */
-
-    await updateDashboardMessage(
-      channel,
-      state,
-      pngBuffer
-    );
-  } finally {
-    client.destroy();
-  }
-
-  /*
-    9. Save state.
-  */
-
-  saveState(
-    state
-  );
-
-  console.log(
-    "MGKK check completed successfully."
-  );
-}
-
-/* =========================================================
-   START
-========================================================= */
-
-main().catch(
-  (error) => {
-    console.error(
-      "MGKK BOT ERROR:"
-    );
-
-    console.error(
-      error
-    );
-
-    process.exitCode = 1;
-  }
-);  if (!fs.existsSync(STATE_FILE)) {
-    return {
-      leagueName: LEAGUE_NAME,
-      snapshots: [],
-      previousRank: null,
-      dashboardMessageId: null,
-    };
-  }
-
-  try {
-    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-
-    return {
-      leagueName: LEAGUE_NAME,
-      snapshots: Array.isArray(state.snapshots)
-        ? state.snapshots
-        : [],
-      previousRank:
-        Number.isFinite(state.previousRank)
-          ? state.previousRank
-          : null,
-      dashboardMessageId:
-        typeof state.dashboardMessageId === "string"
-          ? state.dashboardMessageId
-          : null,
-    };
-  } catch {
-    console.warn("state.json is invalid. Starting fresh.");
-
-    return {
-      leagueName: LEAGUE_NAME,
-      snapshots: [],
-      previousRank: null,
-      dashboardMessageId: null,
-    };
-  }
-}
-
-function saveState(state) {
-  fs.writeFileSync(
-    STATE_FILE,
-    JSON.stringify(state, null, 2),
-    "utf8"
-  );
-}
-
-function formatPoints(value) {
-  if (!Number.isFinite(value)) {
-    return "0";
-  }
-
-  const abs = Math.abs(value);
-
-  if (abs >= 1_000_000_000) {
-    return `${(value / 1_000_000_000).toFixed(2)}b`;
-  }
-
-  if (abs >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(2)}m`;
-  }
-
-  if (abs >= 1_000) {
-    return `${(value / 1_000).toFixed(2)}k`;
-  }
-
-  return Math.round(value).toLocaleString("en-US");
-}
-
-function formatFullPoints(value) {
-  return Math.round(value || 0).toLocaleString("en-US");
-}
-
-function formatDelta(value) {
-  if (value === null || value === undefined) {
-    return "—";
-  }
-
-  if (!Number.isFinite(value)) {
-    return "—";
-  }
-
-  if (value === 0) {
-    return "0";
-  }
-
-  return `${value > 0 ? "+" : ""}${formatPoints(value)}`;
-}
-
-function escapeXml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-/* =========================================================
-   HTTP
-========================================================= */
-
-function getJson(url) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(
-      url,
-      {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "MGKK-Discord-Bot/2.0",
-        },
-      },
-      (response) => {
-        let body = "";
-
-        response.setEncoding("utf8");
-
-        response.on("data", (chunk) => {
-          body += chunk;
-        });
-
-        response.on("end", () => {
-          let parsed;
-
-          try {
-            parsed = JSON.parse(body);
-          } catch {
-            reject(
-              new Error(
-                `Invalid JSON from API (${response.statusCode}).`
-              )
-            );
-            return;
-          }
-
-          if (
-            response.statusCode < 200 ||
-            response.statusCode >= 300
-          ) {
-            const message =
-              parsed?.error?.message ||
-              `HTTP ${response.statusCode}`;
-
-            reject(new Error(message));
-            return;
-          }
-
-          if (parsed?.status === "error") {
-            reject(
-              new Error(
-                parsed?.error?.message ||
-                  "API returned an error."
-              )
-            );
-            return;
-          }
-
-          resolve(parsed);
-        });
-      }
-    );
-
-    request.setTimeout(20_000, () => {
-      request.destroy(
-        new Error("API request timed out.")
-      );
-    });
-
-    request.on("error", reject);
-  });
-}
-
-async function getLeague() {
-  const url =
-    `${API_BASE}/leagues/` +
-    encodeURIComponent(LEAGUE_NAME);
-
-  const response = await getJson(url);
-
-  if (!response?.data) {
-    throw new Error("League API returned no data.");
-  }
-
-  return response.data;
-}
-
-/* =========================================================
-   LEAGUE RANK
-========================================================= */
-
-/*
-  The league detail endpoint gives us the league itself,
-  but not its global rank.
-
-  We therefore inspect leaderboard pages around the previous
-  rank and expand outward when necessary.
-
-  Page size = 100, which is the API maximum.
-*/
-
-async function getLeagueRank(points, previousRank) {
-  const PAGE_SIZE = 100;
-
-  let center;
-
-  if (
-    Number.isFinite(previousRank) &&
-    previousRank > 0
-  ) {
-    center = Math.max(
-      1,
-      Math.floor((previousRank - 1) / PAGE_SIZE) + 1
-    );
-  } else {
-    center = 1;
-  }
-
-  const checkedPages = new Set();
-
-  async function checkPage(page) {
-    if (checkedPages.has(page)) {
-      return null;
-    }
-
-    checkedPages.add(page);
-
-    const url =
-      `${API_BASE}/leagues` +
-      `?page=${page}` +
-      `&pageSize=${PAGE_SIZE}` +
-      `&sort=Points` +
-      `&sortOrder=desc`;
-
-    const response = await getJson(url);
-
-    const leagues =
-      response?.data?.leagues || [];
-
-    for (let index = 0; index < leagues.length; index++) {
-      const league = leagues[index];
-
-      if (
-        String(league.Name).toLowerCase() ===
-        LEAGUE_NAME.toLowerCase()
-      ) {
-        return (
-          (page - 1) * PAGE_SIZE +
-          index +
-          1
-        );
-      }
-    }
-
-    return null;
-  }
-
-  /*
-    First try the previous position.
-  */
-  let rank = await checkPage(center);
-
-  if (rank) {
-    return rank;
-  }
-
-  /*
-    Search nearby pages.
-  */
-  for (let distance = 1; distance <= 10; distance++) {
-    const pages = [
-      center - distance,
-      center + distance,
-    ].filter((page) => page >= 1);
-
-    for (const page of pages) {
-      rank = await checkPage(page);
-
-      if (rank) {
-        return rank;
-      }
-    }
-  }
-
-  /*
-    If this is the first run, scan the first 20 pages.
-    This covers the top 2000 leagues.
-  */
-  if (!Number.isFinite(previousRank)) {
-    for (let page = 1; page <= 20; page++) {
-      rank = await checkPage(page);
-
-      if (rank) {
-        return rank;
-      }
-    }
-  }
-
-  /*
-    If the league wasn't found near the previous rank,
-    expand progressively.
-
-    This avoids downloading the entire leaderboard on every
-    5-minute run.
-  */
-  const expansion = [
-    25,
-    50,
-    75,
-    100,
-    150,
-    200,
-    300,
-    400,
-    500,
-    700,
-    900,
-  ];
-
-  for (const page of expansion) {
-    rank = await checkPage(page);
-
-    if (rank) {
-      return rank;
-    }
-  }
-
-  /*
-    We do not invent a rank.
-  */
-  console.warn(
-    `Could not find ${LEAGUE_NAME} in inspected leaderboard pages.`
-  );
-
-  return null;
-}
-
-/* =========================================================
-   MEMBERS / CONTRIBUTIONS
-========================================================= */
-
-function buildRoster(league) {
-  const roster = [];
-
-  if (league.Owner?.UserID != null) {
-    roster.push({
-      userId: String(league.Owner.UserID),
-      displayName:
-        league.Owner.DisplayName ||
-        String(league.Owner.UserID),
-    });
-  }
-
-  if (Array.isArray(league.Members)) {
-    for (const member of league.Members) {
-      if (member?.UserID == null) {
-        continue;
-      }
-
-      const userId = String(member.UserID);
-
-      if (
-        roster.some(
-          (player) => player.userId === userId
-        )
-      ) {
-        continue;
-      }
-
-      roster.push({
-        userId,
-        displayName:
-          member.DisplayName || userId,
-      });
-    }
-  }
-
-  return roster.slice(0, 4);
-}
-
-function buildContributionMap(league) {
-  const map = new Map();
-
-  if (!Array.isArray(league.PointContributions)) {
-    return map;
-  }
-
-  for (const entry of league.PointContributions) {
-    if (entry?.UserID == null) {
-      continue;
-    }
-
-    map.set(String(entry.UserID), {
-      userId: String(entry.UserID),
-      displayName:
-        entry.DisplayName ||
-        String(entry.UserID),
-      points: Number(entry.Points) || 0,
-      timestamp:
-        Number.isFinite(Number(entry.Timestamp))
-          ? Number(entry.Timestamp)
-          : null,
-    });
-  }
-
-  return map;
-}
-
-function buildPlayers(league) {
-  const roster = buildRoster(league);
-  const contributionMap =
-    buildContributionMap(league);
-
-  return roster.map((member) => {
-    const contribution =
-      contributionMap.get(member.userId);
-
-    return {
-      userId: member.userId,
-      displayName:
-        contribution?.displayName ||
-        member.displayName ||
-        member.userId,
-      points:
-        contribution?.points || 0,
-      timestamp:
-        contribution?.timestamp || null,
-    };
-  });
-}
-
-/* =========================================================
-   HISTORY
-========================================================= */
-
-function addSnapshot(state, players, timestamp) {
-  const playerPoints = {};
-
-  for (const player of players) {
-    playerPoints[player.userId] =
-      Number(player.points) || 0;
-  }
-
-  state.snapshots.push({
-    timestamp,
-    players: playerPoints,
-  });
-
-  const cutoff =
-    timestamp - HISTORY_RETENTION;
-
-  state.snapshots =
-    state.snapshots.filter(
-      (snapshot) =>
-        Number(snapshot.timestamp) >= cutoff
-    );
-
-  /*
-    Remove snapshots that are almost identical in time.
-    This prevents duplicate runs from bloating state.json.
-  */
-  const cleaned = [];
-
-  for (const snapshot of state.snapshots) {
-    const last =
-      cleaned[cleaned.length - 1];
-
-    if (
-      !last ||
-      Math.abs(
-        snapshot.timestamp -
-          last.timestamp
-      ) >= 60
-    ) {
-      cleaned.push(snapshot);
-    }
-  }
-
-  state.snapshots = cleaned;
-}
-
-function getPointsAtOrBefore(
-  state,
-  userId,
-  targetTimestamp
-) {
-  let best = null;
-
-  for (const snapshot of state.snapshots) {
-    if (
-      Number(snapshot.timestamp) <=
-      targetTimestamp
-    ) {
-      if (
-        !best ||
-        Number(snapshot.timestamp) >
-          Number(best.timestamp)
-      ) {
-        best = snapshot;
-      }
-    }
-  }
-
-  if (!best) {
-    return null;
-  }
-
-  const points =
-    best.players?.[userId];
-
-  if (!Number.isFinite(Number(points))) {
-    return null;
-  }
-
-  return Number(points);
-}
-
-function getDelta(
-  state,
-  userId,
-  currentPoints,
-  millisecondsAgo
-) {
-  const now = Date.now();
-  const target =
-    now - millisecondsAgo;
-
-  const oldPoints =
-    getPointsAtOrBefore(
-      state,
-      userId,
-      target
-    );
-
-  if (oldPoints === null) {
-    return null;
-  }
-
-  return currentPoints - oldPoints;
 }
 
 /* =========================================================
    ROBLOX AVATARS
 ========================================================= */
 
-function getAvatarUrl(userIds) {
-  if (!userIds.length) {
+async function downloadBuffer(url) {
+  try {
+    const response =
+      await fetch(url);
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return Buffer.from(
+      await response.arrayBuffer()
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function getAvatars(userIds) {
+  const ids = userIds
+    .filter(Boolean)
+    .join(",");
+
+  if (!ids) {
     return new Map();
   }
 
-  return getJson(
-    "https://thumbnails.roblox.com/v1/users/avatar-headshot" +
-      `?userIds=${userIds.join(",")}` +
-      "&size=150x150" +
-      "&format=Png" +
-      "&isCircular=true"
-  )
-    .then((response) => {
-      const map = new Map();
+  const url =
+    `${ROBLOX_THUMBNAILS}` +
+    `?userIds=${encodeURIComponent(ids)}` +
+    `&size=150x150` +
+    `&format=Png` +
+    `&isCircular=false`;
 
-      for (const item of response?.data || []) {
-        if (
-          item?.targetId != null &&
-          item?.imageUrl
-        ) {
-          map.set(
-            String(item.targetId),
-            item.imageUrl
-          );
-        }
+  try {
+    const data =
+      await fetchJson(url);
+
+    const map = new Map();
+
+    const results =
+      Array.isArray(data.data)
+        ? data.data
+        : [];
+
+    for (const item of results) {
+      if (
+        !item?.targetId ||
+        !item?.imageUrl
+      ) {
+        continue;
       }
 
-      return map;
-    })
-    .catch((error) => {
-      console.warn(
-        "Could not load Roblox avatars:",
-        error.message
+      const image =
+        await downloadBuffer(
+          item.imageUrl
+        );
+
+      if (!image) {
+        continue;
+      }
+
+      /*
+        Embed the image directly inside
+        the SVG as base64.
+
+        This prevents Sharp/librsvg from
+        needing to download the image itself.
+      */
+
+      map.set(
+        String(item.targetId),
+        `data:image/png;base64,${image.toString(
+          "base64"
+        )}`
       );
+    }
 
-      return new Map();
-    });
-}
+    return map;
+  } catch (error) {
+    console.warn(
+      "Roblox avatar lookup failed:",
+      error.message
+    );
 
-function downloadBuffer(url) {
-  return new Promise((resolve, reject) => {
-    https.get(
-      url,
-      {
-        headers: {
-          "User-Agent": "MGKK-Discord-Bot/2.0",
-        },
-      },
-      (response) => {
-        if (
-          response.statusCode >= 300 &&
-          response.statusCode < 400 &&
-          response.headers.location
-        ) {
-          downloadBuffer(
-            response.headers.location
-          )
-            .then(resolve)
-            .catch(reject);
-
-          return;
-        }
-
-        if (response.statusCode !== 200) {
-          reject(
-            new Error(
-              `Avatar HTTP ${response.statusCode}`
-            )
-          );
-          return;
-        }
-
-        const chunks = [];
-
-        response.on("data", (chunk) => {
-          chunks.push(chunk);
-        });
-
-        response.on("end", () => {
-          resolve(
-            Buffer.concat(chunks)
-          );
-        });
-      }
-    ).on("error", reject);
-  });
+    return new Map();
+  }
 }
 
 /* =========================================================
-   SVG DASHBOARD
+   STATE SNAPSHOT
 ========================================================= */
 
-const PLAYER_COLORS = [
-  "#19c7ff",
-  "#ff3ca6",
-  "#ffab19",
-  "#35e0b2",
-];
-
-function makeText(
-  x,
-  y,
-  text,
-  options = {}
+function createSnapshot(
+  players,
+  timestamp
 ) {
-  const {
-    size = 24,
-    weight = 400,
-    fill = "#ffffff",
-    anchor = "start",
-    opacity = 1,
-    family = "Arial, Helvetica, sans-serif",
-  } = options;
+  const playerData = {};
 
-  return `
-    <text
-      x="${x}"
-      y="${y}"
-      font-family="${family}"
-      font-size="${size}px"
-      font-weight="${weight}"
-      fill="${fill}"
-      text-anchor="${anchor}"
-      opacity="${opacity}"
-    >${escapeXml(text)}</text>
-  `;
+  for (const player of players) {
+    playerData[player.userId] = {
+      displayName:
+        player.displayName,
+
+      points:
+        player.points,
+
+      timestamp:
+        player.timestamp,
+    };
+  }
+
+  return {
+    timestamp,
+    players: playerData,
+  };
 }
 
-function makeRoundedRect(
+/* =========================================================
+   HISTORICAL DATA
+========================================================= */
+
+function getHistoricalPoints(
+  state,
+  userId,
+  hours
+) {
+  const targetTime =
+    Date.now() -
+    hours *
+      60 *
+      60 *
+      1000;
+
+  const snapshots =
+    [...state.snapshots].sort(
+      (a, b) =>
+        Number(a.timestamp) -
+        Number(b.timestamp)
+    );
+
+  let selected = null;
+
+  for (const snapshot of snapshots) {
+    if (
+      Number(snapshot.timestamp) <=
+      targetTime
+    ) {
+      selected = snapshot;
+    } else {
+      break;
+    }
+  }
+
+  if (
+    !selected ||
+    !selected.players ||
+    !selected.players[userId]
+  ) {
+    return null;
+  }
+
+  return Number(
+    selected.players[userId].points || 0
+  );
+}
+
+function getHistoricalDelta(
+  state,
+  userId,
+  currentPoints,
+  hours
+) {
+  const oldPoints =
+    getHistoricalPoints(
+      state,
+      userId,
+      hours
+    );
+
+  if (oldPoints == null) {
+    return null;
+  }
+
+  return Math.max(
+    0,
+    Number(currentPoints || 0) -
+      oldPoints
+  );
+}
+
+/* =========================================================
+   CHART
+========================================================= */
+
+function makeChartSvg(
+  players,
+  state,
   x,
   y,
   width,
-  height,
-  radius,
-  fill,
-  stroke = "none",
-  strokeWidth = 0
+  height
 ) {
-  return `
-    <rect
-      x="${x}"
-      y="${y}"
-      width="${width}"
-      height="${height}"
-      rx="${radius}"
-      fill="${fill}"
-      stroke="${stroke}"
-      stroke-width="${strokeWidth}"
-    />
-  `;
+  const left =
+    x + 70;
+
+  const right =
+    x + width - 30;
+
+  const top =
+    y + 60;
+
+  const bottom =
+    y + height - 55;
+
+  const chartWidth =
+    right - left;
+
+  const chartHeight =
+    bottom - top;
+
+  const values =
+    players.map(
+      (player) =>
+        Number(player.points) || 0
+    );
+
+  const maxValue =
+    Math.max(
+      1,
+      ...values
+    );
+
+  let output = "";
+
+  const gridLines = 4;
+
+  /*
+    Horizontal grid.
+  */
+
+  for (
+    let i = 0;
+    i <= gridLines;
+    i++
+  ) {
+    const gridY =
+      top +
+      (chartHeight * i) /
+        gridLines;
+
+    const value =
+      maxValue *
+      (1 - i / gridLines);
+
+    output += `
+      <line
+        x1="${left}"
+        y1="${gridY}"
+        x2="${right}"
+        y2="${gridY}"
+        stroke="#303741"
+        stroke-width="1"
+      />
+    `;
+
+    output += svgText(
+      formatCompact(value),
+      left - 12,
+      gridY + 5,
+      14,
+      500,
+      "#9AA5B5",
+      "end"
+    );
+  }
+
+  output += svgText(
+    "24H",
+    left,
+    bottom + 35,
+    14,
+    600,
+    "#8E99A8",
+    "middle"
+  );
+
+  output += svgText(
+    "NOW",
+    right,
+    bottom + 35,
+    14,
+    600,
+    "#8E99A8",
+    "middle"
+  );
+
+  /*
+    One line per player.
+  */
+
+  players.forEach(
+    (player, index) => {
+      const color =
+        COLORS[
+          index % COLORS.length
+        ];
+
+      const current =
+        Number(player.points) || 0;
+
+      const oldPoints =
+        getHistoricalPoints(
+          state,
+          player.userId,
+          24
+        );
+
+      const startingValue =
+        oldPoints == null
+          ? 0
+          : oldPoints;
+
+      const startX =
+        left;
+
+      const startY =
+        bottom -
+        (startingValue /
+          maxValue) *
+          chartHeight;
+
+      const endX =
+        right;
+
+      const endY =
+        bottom -
+        (current /
+          maxValue) *
+          chartHeight;
+
+      output += `
+        <line
+          x1="${startX}"
+          y1="${startY}"
+          x2="${endX}"
+          y2="${endY}"
+          stroke="${color}"
+          stroke-width="5"
+          stroke-linecap="round"
+        />
+
+        <circle
+          cx="${endX}"
+          cy="${endY}"
+          r="7"
+          fill="${color}"
+        />
+      `;
+
+      const legendX =
+        left +
+        index * 310;
+
+      output += `
+        <circle
+          cx="${legendX}"
+          cy="${y + 28}"
+          r="6"
+          fill="${color}"
+        />
+      `;
+
+      output += svgText(
+        truncate(
+          player.displayName,
+          24
+        ),
+        legendX + 15,
+        y + 33,
+        14,
+        600,
+        "#E8EDF4"
+      );
+    }
+  );
+
+  return output;
 }
 
-function makeDashboardSvg({
-  league,
-  rank,
-  players,
-  state,
-  avatarBuffers,
-}) {
-  const width = 1600;
-  const height = 1080;
+/* =========================================================
+   DASHBOARD IMAGE
+========================================================= */
 
-  const bg = "#17191d";
-  const panel = "#20242a";
-  const panel2 = "#252a31";
-  const border = "#30363e";
-  const muted = "#8f98a5";
-  const white = "#f4f6f8";
+async function renderDashboard(
+  league,
+  players,
+  rank,
+  state
+) {
+  const avatars =
+    await getAvatars(
+      players.map(
+        (player) =>
+          player.userId
+      )
+    );
+
+  const rowsTop = 390;
+  const rowHeight = 64;
+
+  const chartY =
+    rowsTop +
+    rowHeight * 4 +
+    18;
+
+  const chartHeight = 260;
 
   let svg = `
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    width="${width}"
-    height="${height}"
-    viewBox="0 0 ${width} ${height}"
-  >
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="${WIDTH}"
+  height="${HEIGHT}"
+>
 
-    <defs>
+  <!-- BACKGROUND -->
 
-      <linearGradient
-        id="headerGradient"
-        x1="0"
-        y1="0"
-        x2="1"
-        y2="1"
-      >
-        <stop offset="0%" stop-color="#202a35"/>
-        <stop offset="100%" stop-color="#171a1f"/>
-      </linearGradient>
+  <rect
+    width="${WIDTH}"
+    height="${HEIGHT}"
+    fill="#15181D"
+  />
 
-      <filter
-        id="shadow"
-        x="-20%"
-        y="-20%"
-        width="140%"
-        height="140%"
-      >
-        <feDropShadow
-          dx="0"
-          dy="8"
-          stdDeviation="12"
-          flood-color="#000000"
-          flood-opacity="0.30"
-        />
-      </filter>
+  <!-- HEADER -->
 
-    </defs>
+  ${roundedRect(
+    34,
+    28,
+    1532,
+    140,
+    24,
+    "#1B2128",
+    "#303943",
+    2
+  )}
 
-    ${makeRoundedRect(
-      0,
-      0,
-      width,
-      height,
-      34,
-      bg
-    )}
+  ${svgText(
+    "★",
+    70,
+    92,
+    54,
+    700,
+    "#FFFFFF"
+  )}
 
-    ${makeRoundedRect(
-      36,
-      30,
-      width - 72,
-      145,
-      24,
-      "url(#headerGradient)",
-      border,
-      2
-    )}
+  ${svgText(
+    league.Name || LEAGUE_NAME,
+    132,
+    82,
+    38,
+    700,
+    "#F4F7FB"
+  )}
 
-    ${makeText(
-      75,
-      82,
-      `⭐ ${league.Name || LEAGUE_NAME}`,
-      {
-        size: 42,
-        weight: 800,
-        fill: white,
-      }
-    )}
+  ${svgText(
+    "League dashboard",
+    72,
+    124,
+    20,
+    500,
+    "#9CA7B6"
+  )}
 
-    ${makeText(
-      75,
-      125,
-      "League dashboard",
-      {
-        size: 22,
-        weight: 500,
-        fill: muted,
-      }
-    )}
+  ${svgText(
+    rank ? `#${rank}` : "#?",
+    1510,
+    78,
+    38,
+    700,
+    "#FFD34E",
+    "end"
+  )}
 
-    ${makeText(
-      width - 75,
-      80,
-      rank ? `#${rank}` : "#—",
-      {
-        size: 42,
-        weight: 800,
-        fill: "#ffd35a",
-        anchor: "end",
-      }
-    )}
+  ${svgText(
+    "GLOBAL RANK",
+    1510,
+    120,
+    18,
+    700,
+    "#9CA7B6",
+    "end"
+  )}
 
-    ${makeText(
-      width - 75,
-      122,
-      "GLOBAL RANK",
-      {
-        size: 18,
-        weight: 700,
-        fill: muted,
-        anchor: "end",
-      }
-    )}
+  <!-- TOTAL POINTS -->
 
-    ${makeRoundedRect(
-      36,
-      200,
-      width - 72,
-      135,
-      24,
-      panel,
-      border,
-      2
-    )}
+  ${roundedRect(
+    34,
+    190,
+    1532,
+    128,
+    24,
+    "#1E242A",
+    "#303943",
+    2
+  )}
 
-    ${makeText(
-      75,
-      250,
-      "TOTAL LEAGUE POINTS",
-      {
-        size: 18,
-        weight: 700,
-        fill: muted,
-      }
-    )}
+  ${svgText(
+    "TOTAL LEAGUE POINTS",
+    72,
+    238,
+    18,
+    700,
+    "#9CA7B6"
+  )}
 
-    ${makeText(
-      75,
-      305,
-      formatFullPoints(
-        Number(league.Points) || 0
-      ),
-      {
-        size: 46,
-        weight: 800,
-        fill: white,
-      }
-    )}
+  ${svgText(
+    formatNumber(league.Points),
+    72,
+    286,
+    40,
+    700,
+    "#F4F7FB"
+  )}
 
-    ${makeText(
-      width - 75,
-      255,
-      `${players.length}/4 MEMBERS`,
-      {
-        size: 20,
-        weight: 700,
-        fill: "#55d7ff",
-        anchor: "end",
-      }
-    )}
+  ${svgText(
+    `${players.length}/${
+      league.MemberCapacity || 4
+    } MEMBERS`,
+    1510,
+    236,
+    18,
+    700,
+    "#48D5FF",
+    "end"
+  )}
 
-    ${makeText(
-      width - 75,
-      302,
-      "Live API data",
-      {
-        size: 18,
-        weight: 500,
-        fill: muted,
-        anchor: "end",
-      }
-    )}
+  ${svgText(
+    "Live API data",
+    1510,
+    282,
+    16,
+    500,
+    "#9CA7B6",
+    "end"
+  )}
 
-    ${makeText(
-      55,
-      395,
-      "PLAYER CONTRIBUTIONS",
-      {
-        size: 20,
-        weight: 800,
-        fill: white,
-      }
-    )}
+  <!-- PLAYER CONTRIBUTIONS TITLE -->
 
-    ${makeRoundedRect(
-      36,
-      420,
-      width - 72,
-      300,
-      24,
-      panel,
-      border,
-      2
-    )}
+  ${svgText(
+    "PLAYER CONTRIBUTIONS",
+    52,
+    372,
+    20,
+    700,
+    "#F4F7FB"
+  )}
+
+  <!-- TABLE -->
+
+  ${roundedRect(
+    34,
+    390,
+    1532,
+    256,
+    24,
+    "#1E242A",
+    "#303943",
+    2
+  )}
+
+  ${svgText(
+    "PLAYER",
+    160,
+    428,
+    15,
+    700,
+    "#9AA5B5"
+  )}
+
+  ${svgText(
+    "CONTRIBUTED",
+    700,
+    428,
+    15,
+    700,
+    "#9AA5B5",
+    "end"
+  )}
+
+  ${svgText(
+    "+1H",
+    875,
+    428,
+    15,
+    700,
+    "#9AA5B5",
+    "end"
+  )}
+
+  ${svgText(
+    "+24H",
+    1045,
+    428,
+    15,
+    700,
+    "#9AA5B5",
+    "end"
+  )}
+
+  ${svgText(
+    "SHARE",
+    1195,
+    428,
+    15,
+    700,
+    "#9AA5B5",
+    "end"
+  )}
+
+  ${svgText(
+    "UPDATED",
+    1450,
+    428,
+    15,
+    700,
+    "#9AA5B5",
+    "end"
+  )}
   `;
 
   /*
-    Table header
+    Exactly 4 player rows.
   */
 
-  svg += makeText(
-    170,
-    460,
-    "PLAYER",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-    }
-  );
+  for (
+    let index = 0;
+    index < 4;
+    index++
+  ) {
+    const player =
+      players[index] || {
+        userId: "-",
+        displayName: "-",
+        points: 0,
+        timestamp: null,
+      };
 
-  svg += makeText(
-    700,
-    460,
-    "CONTRIBUTED",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    880,
-    460,
-    "+1H",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    1050,
-    460,
-    "+24H",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    1230,
-    460,
-    "SHARE",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += makeText(
-    1515,
-    460,
-    "UPDATED",
-    {
-      size: 16,
-      weight: 700,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  const totalPoints =
-    players.reduce(
-      (sum, player) =>
-        sum + Number(player.points || 0),
-      0
-    );
-
-  const rowHeight = 62;
-
-  players.forEach((player, index) => {
-    const y = 480 + index * rowHeight;
     const color =
-      PLAYER_COLORS[index];
+      COLORS[
+        index % COLORS.length
+      ];
 
-    if (index > 0) {
-      svg += `
-        <line
-          x1="70"
-          y1="${y - 5}"
-          x2="${width - 70}"
-          y2="${y - 5}"
-          stroke="${border}"
-          stroke-width="1"
-        />
-      `;
-    }
+    const y =
+      rowsTop +
+      48 +
+      index * rowHeight;
+
+    const oneHour =
+      getHistoricalDelta(
+        state,
+        player.userId,
+        player.points,
+        1
+      );
+
+    const twentyFourHours =
+      getHistoricalDelta(
+        state,
+        player.userId,
+        player.points,
+        24
+      );
+
+    const share =
+      Number(league.Points) > 0
+        ? (
+            Number(player.points) /
+            Number(league.Points)
+          ) * 100
+        : 0;
+
+    /*
+      Color marker.
+    */
 
     svg += `
       <rect
-        x="52"
-        y="${y + 8}"
+        x="49"
+        y="${y - 30}"
         width="6"
-        height="42"
+        height="40"
         rx="3"
         fill="${color}"
       />
     `;
 
     /*
-      Avatar
+      Avatar background.
+    */
+
+    svg += roundedRect(
+      78,
+      y - 30,
+      46,
+      46,
+      23,
+      "#39414A"
+    );
+
+    /*
+      Avatar.
     */
 
     const avatar =
-      avatarBuffers.get(player.userId);
+      avatars.get(
+        String(player.userId)
+      );
 
     if (avatar) {
-      const avatarData =
-        avatar.toString("base64");
-
       svg += `
         <defs>
           <clipPath id="avatar-${index}">
             <circle
-              cx="105"
-              cy="${y + 29}"
-              r="23"
+              cx="101"
+              cy="${y - 7}"
+              r="21"
             />
           </clipPath>
         </defs>
 
-        <circle
-          cx="105"
-          cy="${y + 29}"
-          r="25"
-          fill="#343a43"
-        />
-
         <image
-          href="data:image/png;base64,${avatarData}"
+          href="${avatar}"
           x="80"
-          y="${y + 4}"
-          width="50"
-          height="50"
+          y="${y - 28}"
+          width="42"
+          height="42"
           preserveAspectRatio="xMidYMid slice"
           clip-path="url(#avatar-${index})"
         />
       `;
-    } else {
+    }
+
+    /*
+      DISPLAY NAME
+    */
+
+    svg += svgText(
+      truncate(
+        player.displayName,
+        24
+      ),
+      160,
+      y - 5,
+      21,
+      700,
+      "#F2F5F9"
+    );
+
+    /*
+      USER ID
+    */
+
+    svg += svgText(
+      `ID ${player.userId}`,
+      160,
+      y + 18,
+      13,
+      500,
+      "#7F8B9A"
+    );
+
+    /*
+      CONTRIBUTED
+    */
+
+    svg += svgText(
+      `★ ${formatCompact(
+        player.points
+      )}`,
+      700,
+      y + 3,
+      21,
+      700,
+      color,
+      "end"
+    );
+
+    /*
+      +1H
+    */
+
+    svg += svgText(
+      oneHour == null
+        ? "—"
+        : `+${formatCompact(
+            oneHour
+          )}`,
+      875,
+      y + 3,
+      18,
+      600,
+      oneHour == null
+        ? "#8B96A4"
+        : "#DCE3EB",
+      "end"
+    );
+
+    /*
+      +24H
+    */
+
+    svg += svgText(
+      twentyFourHours == null
+        ? "—"
+        : `+${formatCompact(
+            twentyFourHours
+          )}`,
+      1045,
+      y + 3,
+      18,
+      600,
+      twentyFourHours == null
+        ? "#8B96A4"
+        : "#DCE3EB",
+      "end"
+    );
+
+    /*
+      SHARE
+    */
+
+    svg += svgText(
+      `${share.toFixed(1)}%`,
+      1195,
+      y + 3,
+      18,
+      700,
+      color,
+      "end"
+    );
+
+    /*
+      LAST UPDATE
+    */
+
+    const updated =
+      player.timestamp
+        ? new Date(
+            Number(
+              player.timestamp
+            ) * 1000
+          ).toLocaleTimeString(
+            "en-US",
+            {
+              hour: "2-digit",
+              minute: "2-digit",
+            }
+          )
+        : "—";
+
+    svg += svgText(
+      updated,
+      1450,
+      y + 3,
+      17,
+      600,
+      "#9AA5B5",
+      "end"
+    );
+
+    /*
+      Separator.
+    */
+
+    if (index < 3) {
       svg += `
-        <circle
-          cx="105"
-          cy="${y + 29}"
-          r="25"
-          fill="#343a43"
+        <line
+          x1="160"
+          y1="${y + 34}"
+          x2="1450"
+          y2="${y + 34}"
+          stroke="#2B323A"
+          stroke-width="1"
         />
       `;
     }
+  }
 
-    const name =
-      String(player.displayName || player.userId);
+  /*
+    CHART
+  */
 
-    const points =
-      Number(player.points) || 0;
-
-    const delta1h =
-      getDelta(
-        state,
-        player.userId,
-        points,
-        60 * 60 * 1000
-      );
-
-    const delta24h =
-      getDelta(
-        state,
-        player.userId,
-        points,
-        24 * 60 * 60 * 1000
-      );
-
-    const share =
-      totalPoints > 0
-        ? (points / totalPoints) * 100
-        : 0;
-
-    let updated = "—";
-
-    if (player.timestamp) {
-      updated =
-        new Date(
-          player.timestamp * 1000
-        ).toLocaleTimeString(
-          "en-US",
-          {
-            hour: "2-digit",
-            minute: "2-digit",
-          }
-        );
-    }
-
-    svg += makeText(
-      170,
-      y + 28,
-      name.length > 22
-        ? `${name.slice(0, 21)}…`
-        : name,
-      {
-        size: 22,
-        weight: 700,
-        fill: white,
-      }
-    );
-
-    svg += makeText(
-      170,
-      y + 48,
-      `ID ${player.userId}`,
-      {
-        size: 13,
-        weight: 500,
-        fill: muted,
-      }
-    );
-
-    svg += makeText(
+  svg += `
+    ${svgText(
+      "CONTRIBUTION HISTORY — LAST 24H",
+      52,
+      chartY - 12,
+      20,
       700,
-      y + 37,
-      formatPoints(points),
-      {
-        size: 23,
-        weight: 800,
-        fill: color,
-        anchor: "end",
-      }
-    );
+      "#F4F7FB"
+    )}
 
-    svg += makeText(
-      880,
-      y + 37,
-      formatDelta(delta1h),
-      {
-        size: 20,
-        weight: 700,
-        fill:
-          delta1h === null
-            ? muted
-            : white,
-        anchor: "end",
-      }
-    );
+    ${roundedRect(
+      34,
+      chartY,
+      1532,
+      chartHeight,
+      24,
+      "#1E242A",
+      "#303943",
+      2
+    )}
 
-    svg += makeText(
-      1050,
-      y + 37,
-      formatDelta(delta24h),
-      {
-        size: 20,
-        weight: 700,
-        fill:
-          delta24h === null
-            ? muted
-            : white,
-        anchor: "end",
-      }
-    );
+    ${makeChartSvg(
+      players,
+      state,
+      34,
+      chartY,
+      1532,
+      chartHeight
+    )}
 
-    svg += makeText(
-      1230,
-      y + 37,
-      `${share.toFixed(1)}%`,
-      {
-        size: 20,
-        weight: 700,
-        fill: color,
-        anchor: "end",
-      }
-    );
+    ${svgText(
+      "MGKK • BIG Games API",
+      1535,
+      1042,
+      14,
+      500,
+      "#8994A2",
+      "end"
+    )}
 
-    svg += makeText(
-      1515,
-      y + 37,
-      updated,
-      {
-        size: 18,
-        weight: 600,
-        fill: muted,
-        anchor: "end",
-      }
-    );
-  });
-
-  /*
-    Chart
-  */
-
-  const chartX = 36;
-  const chartY = 755;
-  const chartW = width - 72;
-  const chartH = 270;
-
-  svg += makeText(
-    55,
-    745,
-    "CONTRIBUTION HISTORY — LAST 24H",
-    {
-      size: 20,
-      weight: 800,
-      fill: white,
-    }
-  );
-
-  svg += makeRoundedRect(
-    chartX,
-    chartY,
-    chartW,
-    chartH,
-    24,
-    panel,
-    border,
-    2
-  );
-
-  const historyStart =
-    Date.now() -
-    24 * 60 * 60 * 1000;
-
-  const history =
-    state.snapshots.filter(
-      (snapshot) =>
-        Number(snapshot.timestamp) >=
-        historyStart
-    );
-
-  let maxValue = 1;
-
-  for (const player of players) {
-    for (const snapshot of history) {
-      const value =
-        Number(
-          snapshot.players?.[
-            player.userId
-          ]
-        ) || 0;
-
-      maxValue =
-        Math.max(maxValue, value);
-    }
-  }
-
-  /*
-    Grid
-  */
-
-  const plotLeft = chartX + 75;
-  const plotRight = chartX + chartW - 30;
-  const plotTop = chartY + 25;
-  const plotBottom =
-    chartY + chartH - 45;
-
-  const plotW =
-    plotRight - plotLeft;
-
-  const plotH =
-    plotBottom - plotTop;
-
-  for (let i = 0; i <= 4; i++) {
-    const y =
-      plotTop +
-      (plotH / 4) * i;
-
-    svg += `
-      <line
-        x1="${plotLeft}"
-        y1="${y}"
-        x2="${plotRight}"
-        y2="${y}"
-        stroke="#30363e"
-        stroke-width="1"
-      />
-    `;
-
-    const value =
-      maxValue -
-      (maxValue / 4) * i;
-
-    svg += makeText(
-      plotLeft - 12,
-      y + 6,
-      formatPoints(value),
-      {
-        size: 14,
-        weight: 600,
-        fill: muted,
-        anchor: "end",
-      }
-    );
-  }
-
-  /*
-    X-axis labels
-  */
-
-  const now = Date.now();
-
-  const labels = [
-    {
-      x: plotLeft,
-      text: "24H",
-    },
-    {
-      x: plotLeft + plotW * 0.25,
-      text: "18H",
-    },
-    {
-      x: plotLeft + plotW * 0.5,
-      text: "12H",
-    },
-    {
-      x: plotLeft + plotW * 0.75,
-      text: "6H",
-    },
-    {
-      x: plotRight,
-      text: "NOW",
-    },
-  ];
-
-  for (const label of labels) {
-    svg += makeText(
-      label.x,
-      chartY + chartH - 15,
-      label.text,
-      {
-        size: 14,
-        weight: 700,
-        fill: muted,
-        anchor: "middle",
-      }
-    );
-  }
-
-  /*
-    Player lines
-  */
-
-  players.forEach((player, index) => {
-    const color =
-      PLAYER_COLORS[index];
-
-    const points = [];
-
-    if (history.length === 0) {
-      const current =
-        Number(player.points) || 0;
-
-      points.push({
-        timestamp: now,
-        value: current,
-      });
-    } else {
-      for (const snapshot of history) {
-        const value =
-          Number(
-            snapshot.players?.[
-              player.userId
-            ]
-          ) || 0;
-
-        points.push({
-          timestamp:
-            Number(snapshot.timestamp),
-          value,
-        });
-      }
-
-      /*
-        Add current value as final point.
-      */
-      points.push({
-        timestamp: now,
-        value:
-          Number(player.points) || 0,
-      });
-    }
-
-    const linePoints =
-      points
-        .map((point) => {
-          const ratio =
-            clamp(
-              (point.timestamp -
-                historyStart) /
-                (24 * 60 * 60 * 1000),
-              0,
-              1
-            );
-
-          const x =
-            plotLeft +
-            ratio * plotW;
-
-          const y =
-            plotBottom -
-            (point.value / maxValue) *
-              plotH;
-
-          return `${x.toFixed(1)},${y.toFixed(
-            1
-          )}`;
-        })
-        .join(" ");
-
-    svg += `
-      <polyline
-        points="${linePoints}"
-        fill="none"
-        stroke="${color}"
-        stroke-width="4"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        opacity="0.95"
-      />
-    `;
-
-    /*
-      Current point
-    */
-
-    const currentX = plotRight;
-
-    const currentValue =
-      Number(player.points) || 0;
-
-    const currentY =
-      plotBottom -
-      (currentValue / maxValue) *
-        plotH;
-
-    svg += `
-      <circle
-        cx="${currentX}"
-        cy="${currentY}"
-        r="6"
-        fill="${color}"
-      />
-    `;
-
-    /*
-      Legend
-    */
-
-    const legendX =
-      plotLeft +
-      index * 320;
-
-    svg += `
-      <circle
-        cx="${legendX}"
-        cy="${chartY + 22}"
-        r="5"
-        fill="${color}"
-      />
-    `;
-
-    svg += makeText(
-      legendX + 12,
-      chartY + 27,
-      player.displayName,
-      {
-        size: 15,
-        weight: 700,
-        fill: white,
-      }
-    );
-  });
-
-  svg += makeText(
-    width - 55,
-    height - 18,
-    "MGKK • BIG Games API",
-    {
-      size: 13,
-      weight: 600,
-      fill: muted,
-      anchor: "end",
-    }
-  );
-
-  svg += "</svg>";
-
-  return svg;
-}
-
-/* =========================================================
-   RENDER PNG
-========================================================= */
-
-async function renderDashboard({
-  league,
-  rank,
-  players,
-  state,
-}) {
-  const userIds =
-    players.map(
-      (player) => player.userId
-    );
-
-  const avatarUrls =
-    await getAvatarUrl(userIds);
-
-  const avatarBuffers =
-    new Map();
-
-  for (const player of players) {
-    const url =
-      avatarUrls.get(player.userId);
-
-    if (!url) {
-      continue;
-    }
-
-    try {
-      const buffer =
-        await downloadBuffer(url);
-
-      avatarBuffers.set(
-        player.userId,
-        buffer
-      );
-    } catch (error) {
-      console.warn(
-        `Avatar failed for ${player.userId}:`,
-        error.message
-      );
-    }
-  }
-
-  const svg = makeDashboardSvg({
-    league,
-    rank,
-    players,
-    state,
-    avatarBuffers,
-  });
+</svg>
+`;
 
   return sharp(
     Buffer.from(svg)
   )
-    .png({
-      compressionLevel: 9,
-      quality: 100,
-    })
+    .png()
     .toBuffer();
 }
 
 /* =========================================================
-   DISCORD
+   RANK CHANGE
 ========================================================= */
 
-async function getDiscordChannel(client) {
-  const channel =
-    await client.channels.fetch(
-      DISCORD_CHANNEL_ID
-    );
-
-  if (!channel) {
-    throw new Error(
-      "Discord channel was not found."
-    );
-  }
-
-  if (
-    !channel.isTextBased() ||
-    !channel.messages
-  ) {
-    throw new Error(
-      "DISCORD_CHANNEL_ID is not a text channel."
-    );
-  }
-
-  return channel;
-}
-
-async function updateDashboardMessage(
-  channel,
-  state,
-  pngBuffer,
-  league,
-  rank
-) {
-  const attachment = {
-    attachment: pngBuffer,
-    name: "mgkk-dashboard.png",
-    description:
-      "MGKK League dashboard",
-  };
-
-  /*
-    Try editing the existing dashboard.
-  */
-
-  if (state.dashboardMessageId) {
-    try {
-      const message =
-        await channel.messages.fetch(
-          state.dashboardMessageId
-        );
-
-      await message.edit({
-        content: "",
-        embeds: [],
-        files: [attachment],
-      });
-
-      console.log(
-        `Dashboard updated: ${message.id}`
-      );
-
-      return message.id;
-    } catch (error) {
-      console.warn(
-        "Existing dashboard message could not be edited:",
-        error.message
-      );
-
-      state.dashboardMessageId = null;
-    }
-  }
-
-  /*
-    Create it once if there isn't one.
-  */
-
-  const message =
-    await channel.send({
-      content: "",
-      files: [attachment],
-    });
-
-  state.dashboardMessageId =
-    message.id;
-
-  console.log(
-    `Dashboard created: ${message.id}`
-  );
-
-  return message.id;
-}
-
-/* =========================================================
-   RANK CHANGE NOTIFICATION
-========================================================= */
-
-async function sendRankNotification(
-  channel,
-  league,
+function getRankChange(
   previousRank,
   currentRank
 ) {
   if (
-    !Number.isFinite(previousRank) ||
-    !Number.isFinite(currentRank)
+    previousRank == null ||
+    currentRank == null ||
+    previousRank === currentRank
   ) {
-    return;
-  }
-
-  if (previousRank === currentRank) {
-    return;
+    return null;
   }
 
   const difference =
-    previousRank - currentRank;
+    previousRank -
+    currentRank;
 
-  const improved = difference > 0;
+  if (difference > 0) {
+    return {
+      type: "up",
+      positions: difference,
+    };
+  }
+
+  if (difference < 0) {
+    return {
+      type: "down",
+      positions: Math.abs(
+        difference
+      ),
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   DISCORD RANK MESSAGE
+========================================================= */
+
+async function sendRankMessage(
+  channel,
+  league,
+  rank,
+  previousRank
+) {
+  const change =
+    getRankChange(
+      previousRank,
+      rank
+    );
+
+  if (!change) {
+    return;
+  }
+
+  const increased =
+    change.type === "up";
+
+  const title =
+    increased
+      ? `📈 ${league.Name} — Increased!`
+      : `📉 ${league.Name} — Decreased!`;
+
+  const description =
+    increased
+      ? `**${league.Name}** increased **${change.positions} position${
+          change.positions === 1
+            ? ""
+            : "s"
+        }** in the League Leaderboard!`
+      : `**${league.Name}** decreased **${change.positions} position${
+          change.positions === 1
+            ? ""
+            : "s"
+        }** in the League Leaderboard!`;
 
   const embed =
     new EmbedBuilder()
-      .setTitle(
-        improved
-          ? "📈 MGKK — Increased!"
-          : "📉 MGKK — Decreased"
-      )
+      .setTitle(title)
       .setDescription(
-        improved
-          ? `**${league.Name}** moved **${Math.abs(
-              difference
-            )} position${
-              Math.abs(difference) === 1
-                ? ""
-                : "s"
-            } up** in the League leaderboard.`
-          : `**${league.Name}** moved **${Math.abs(
-              difference
-            )} position${
-              Math.abs(difference) === 1
-                ? ""
-                : "s"
-            } down** in the League leaderboard.`
+        description
       )
       .addFields(
         {
-          name: "⬅️ Previous place",
-          value: `#${previousRank}`,
+          name:
+            "↩️ Previous place",
+          value:
+            `#${previousRank}`,
           inline: true,
         },
         {
-          name: "🏆 Current place",
-          value: `#${currentRank}`,
+          name:
+            "🏆 Current place",
+          value:
+            `#${rank}`,
           inline: true,
         },
         {
-          name: "💎 Points",
-          value: formatFullPoints(
-            Number(league.Points) || 0
-          ),
+          name:
+            "💎 Points",
+          value:
+            formatNumber(
+              league.Points
+            ),
           inline: true,
         }
       )
       .setFooter({
-        text: "MGKK League • BIG Games API",
+        text:
+          `${league.Name} League • BIG Games API`,
       })
       .setTimestamp();
 
@@ -4487,180 +1653,229 @@ async function sendRankNotification(
 ========================================================= */
 
 async function main() {
-  const state = loadState();
-
   console.log(
-    `Checking league ${LEAGUE_NAME}...`
+    `Checking league: ${LEAGUE_NAME}`
   );
 
   /*
-    1. Get actual league data.
+    Get live league data.
   */
 
   const league =
     await getLeague();
 
   /*
-    2. Build roster from Owner + Members.
+    Build the four players from:
+      Owner + Members
+    and match them against:
+      PointContributions
   */
 
   const players =
     buildPlayers(league);
-
-  if (players.length === 0) {
-    throw new Error(
-      "League has no Owner/Members in API response."
-    );
-  }
 
   console.log(
     `League: ${league.Name}`
   );
 
   console.log(
-    `Points: ${formatFullPoints(
+    `Points: ${formatNumber(
       league.Points
     )}`
   );
 
   console.log(
-    `Roster: ${players
-      .map(
-        (player) =>
-          `${player.displayName}=${formatPoints(
-            player.points
-          )}`
-      )
-      .join(", ")}`
+    `Members: ${players.length}/${
+      league.MemberCapacity || 4
+    }`
   );
 
+  for (const player of players) {
+    console.log(
+      ` - ${player.displayName} (${player.userId}) = ${formatNumber(
+        player.points
+      )}`
+    );
+  }
+
   /*
-    3. Calculate current rank.
+    Get exact global rank.
   */
 
-  const currentRank =
-    await getLeagueRank(
-      Number(league.Points) || 0,
-      state.previousRank
+  const rank =
+    await getGlobalRank(
+      league
     );
 
   console.log(
-    `Rank: ${currentRank ?? "unknown"}`
+    `Global rank: ${
+      rank ?? "not found"
+    }`
   );
 
   /*
-    4. Add real API snapshot.
+    Read previous state.
+  */
+
+  const state =
+    readState();
+
+  const previousRank =
+    state.lastRank;
+
+  /*
+    Add current snapshot.
   */
 
   const now =
     Date.now();
 
-  /*
-    Prevent duplicate snapshots if GitHub somehow
-    runs the job twice within a minute.
-  */
-
-  const lastSnapshot =
-    state.snapshots[
-      state.snapshots.length - 1
-    ];
-
-  if (
-    !lastSnapshot ||
-    now -
-      Number(lastSnapshot.timestamp) >=
-      60_000
-  ) {
-    addSnapshot(
-      state,
+  state.snapshots.push(
+    createSnapshot(
       players,
       now
+    )
+  );
+
+  /*
+    Keep 3 days.
+  */
+
+  const keepAfter =
+    now -
+    3 *
+      24 *
+      60 *
+      60 *
+      1000;
+
+  state.snapshots =
+    state.snapshots.filter(
+      (snapshot) =>
+        Number(
+          snapshot.timestamp
+        ) >= keepAfter
     );
+
+  /*
+    Save rank.
+  */
+
+  if (rank != null) {
+    state.lastRank = rank;
   }
 
   /*
-    5. Discord.
+    Save state before Discord.
   */
 
-  const client =
-    new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-      ],
-    });
+  writeState(state);
+
+  /*
+    Login Discord.
+  */
 
   await client.login(
     DISCORD_TOKEN
   );
 
-  try {
-    const channel =
-      await getDiscordChannel(
-        client
-      );
+  /*
+    Get channel.
+  */
 
-    /*
-      Rank notification BEFORE updating stored rank.
-    */
-
-    if (
-      currentRank !== null &&
-      Number.isFinite(currentRank)
-    ) {
-      await sendRankNotification(
-        channel,
-        league,
-        state.previousRank,
-        currentRank
-      );
-
-      state.previousRank =
-        currentRank;
-    }
-
-    /*
-      6. Generate ONE dashboard image.
-    */
-
-    const pngBuffer =
-      await renderDashboard({
-        league,
-        rank: currentRank,
-        players,
-        state,
-      });
-
-    /*
-      7. Update the SAME Discord message.
-    */
-
-    await updateDashboardMessage(
-      channel,
-      state,
-      pngBuffer,
-      league,
-      currentRank
+  const channel =
+    await client.channels.fetch(
+      DISCORD_CHANNEL_ID
     );
-  } finally {
-    client.destroy();
+
+  if (
+    !channel ||
+    !channel.isTextBased()
+  ) {
+    throw new Error(
+      "DISCORD_CHANNEL_ID is not a text-based Discord channel."
+    );
   }
 
   /*
-    8. Save state.
+    Rank-change message only
+    when rank actually changed.
   */
 
-  saveState(state);
+  if (
+    rank != null &&
+    previousRank != null
+  ) {
+    await sendRankMessage(
+      channel,
+      league,
+      rank,
+      previousRank
+    );
+  }
+
+  /*
+    Generate dashboard.
+  */
 
   console.log(
-    "MGKK check completed successfully."
+    "Generating dashboard..."
   );
+
+  const png =
+    await renderDashboard(
+      league,
+      players,
+      rank,
+      state
+    );
+
+  /*
+    Send ONE dashboard image.
+  */
+
+  await channel.send({
+    files: [
+      new AttachmentBuilder(
+        png,
+        {
+          name:
+            "mgkk-dashboard.png",
+
+          description:
+            `${league.Name} league dashboard`,
+        }
+      ),
+    ],
+  });
+
+  console.log(
+    "Dashboard sent successfully."
+  );
+
+  await client.destroy();
 }
+
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
 
 main().catch((error) => {
   console.error(
-    "MGKK BOT ERROR:"
+    "========================================"
   );
-  console.error(error);
+
+  console.error(
+    "MGKK BOT ERROR"
+  );
+
+  console.error(
+    "========================================"
+  );
+
+  console.error(
+    error?.stack || error
+  );
 
   process.exitCode = 1;
 });
